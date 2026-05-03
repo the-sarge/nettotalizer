@@ -14,7 +14,8 @@
 # The wrapped command's stdout, stderr, stdin, and exit code are passed through.
 #
 # Platforms:
-#   macOS uses nettop. It measures only the wrapped PID, not child processes.
+#   macOS uses nettop. It measures the wrapped PID and descendants visible to
+#   the sampler.
 #   Linux uses bpftrace. It measures the wrapped PID and descendants forked
 #   after bpftrace attaches. Only bpftrace runs under sudo; the command does not.
 #
@@ -22,9 +23,10 @@
 #   These are socket payload bytes, not full interface bytes. Headers,
 #   retransmits, and lower-level link overhead are not counted.
 #
-#   macOS nettop samples at whole-second intervals. Very fast commands can
-#   finish before the first sample, in which case totalizer reports 0B and
-#   warns that no sample was captured.
+#   macOS nettop samples at whole-second intervals and descendant discovery is
+#   polling-based. Very fast commands or short-lived child processes can finish
+#   before the first sample, in which case totalizer reports 0B and warns that
+#   no sample was captured.
 # =============================================================================
 
 set -u
@@ -44,8 +46,8 @@ Examples:
 Output is written to stderr and the wrapped command's exit code is preserved.
 
 Notes:
-  macOS uses nettop and samples at whole-second intervals, so very short
-  commands may finish before a sample is captured.
+  macOS uses nettop and samples the wrapped process tree at whole-second
+  intervals, so very short commands may finish before a sample is captured.
 
   Linux uses bpftrace and may ask sudo for the tracer only; the wrapped
   command still runs as the original user.
@@ -115,6 +117,17 @@ forward_term() {
   [ -n "${cmd_pid:-}" ] && kill -TERM "$cmd_pid" 2>/dev/null
 }
 
+descendant_pids() {
+  local pid=$1
+  local child
+
+  printf '%s\n' "$pid"
+
+  for child in $(pgrep -P "$pid" 2>/dev/null || true); do
+    descendant_pids "$child"
+  done
+}
+
 run_macos() {
   if ! command -v nettop >/dev/null 2>&1; then
     echo "$prog: nettop not found; running unmeasured" >&2
@@ -141,12 +154,21 @@ run_macos() {
   #   -n       avoid DNS/service lookups while sampling
   #   -L 1     CSV logging mode, one flushed sample per invocation
   #   -s 1     portable one-second interval accepted by macOS nettop
-  #   -p PID   track only the wrapped process
+  #   -p PID   track one process; repeat for descendants discovered below
   #   -J ...   output only the columns we parse
   (
+    local pids pid
+    local nettop_args
+
     while kill -0 "$cmd_pid" 2>/dev/null; do
-      nettop -n -P -x -L 1 -s 1 -p "$cmd_pid" -J bytes_in,bytes_out \
-        >>"$nt_out" 2>/dev/null || true
+      pids=$(descendant_pids "$cmd_pid")
+
+      nettop_args=(-n -P -x -L 1 -s 1 -J bytes_in,bytes_out)
+      for pid in $pids; do
+        nettop_args+=(-p "$pid")
+      done
+
+      nettop "${nettop_args[@]}" >>"$nt_out" 2>/dev/null || true
 
       # Keep the normal sample cadence at one second, but make the pause
       # interruptible so the wrapper does not wait up to a full extra second
@@ -169,8 +191,9 @@ run_macos() {
   wait "$sampler_pid" 2>/dev/null || true
 
   # Count data rows separately from byte totals so a true zero-transfer command
-  # can be distinguished from a command that finished before nettop captured any
-  # sample at all.
+  # can be distinguished from a command/process tree that finished before nettop
+  # captured any sample at all. Because the sampler can track multiple PIDs, keep
+  # a max counter per PID and sum those maxima at the end.
   rx_tx=$(awk -F',' '
     # nettop CSV headers look like:
     #   ,bytes_in,bytes_out,
@@ -186,23 +209,32 @@ run_macos() {
 
     in_col && out_col && $1 != "" {
       samples++
+      key = $1
+      if (match(key, /\.[0-9]+$/)) {
+        key = substr(key, RSTART + 1)
+      }
+      seen[key] = 1
       rx = $in_col + 0
       tx = $out_col + 0
 
       # Counters are cumulative, so the largest value seen is the final total.
-      if (rx > max_rx) max_rx = rx
-      if (tx > max_tx) max_tx = tx
+      if (rx > max_rx[key]) max_rx[key] = rx
+      if (tx > max_tx[key]) max_tx[key] = tx
     }
 
     END {
-      printf "%d %d %d\n", samples + 0, max_rx + 0, max_tx + 0
+      for (key in seen) {
+        total_rx += max_rx[key]
+        total_tx += max_tx[key]
+      }
+      printf "%d %d %d\n", samples + 0, total_rx + 0, total_tx + 0
     }
   ' "$nt_out")
 
   read -r samples rx tx <<<"$rx_tx"
 
   if [ "${samples:-0}" -eq 0 ]; then
-    echo "$prog: no samples captured (command finished before nettop's 1s sample tick)" >&2
+    echo "$prog: no samples captured (process tree finished before nettop's 1s sample tick)" >&2
   fi
 
   print_summary "${rx:-0}" "${tx:-0}"
