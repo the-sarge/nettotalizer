@@ -23,10 +23,11 @@
 #   These are socket payload bytes, not full interface bytes. Headers,
 #   retransmits, and lower-level link overhead are not counted.
 #
-#   macOS nettop samples at whole-second intervals and descendant discovery is
-#   polling-based. Very fast commands or short-lived child processes can finish
-#   before the first sample, in which case totalizer reports 0B and warns that
-#   no sample was captured.
+#   macOS nettop is polled against the visible process tree. Very fast commands
+#   or short-lived child processes can still finish between polls, in which case
+#   totalizer may undercount. If process sampling sees no received bytes but the
+#   default interface did, totalizer falls back to that interface delta; this can
+#   include unrelated system traffic and counts interface bytes, not socket bytes.
 # =============================================================================
 
 set -u
@@ -46,8 +47,10 @@ Examples:
 Output is written to stderr and the wrapped command's exit code is preserved.
 
 Notes:
-  macOS uses nettop and samples the wrapped process tree at whole-second
-  intervals, so very short commands may finish before a sample is captured.
+  macOS uses nettop and polls the wrapped process tree, so very short child
+  processes may finish between samples. If that misses received bytes, totalizer
+  may fall back to default-interface byte deltas, which can include unrelated
+  system traffic.
 
   Linux uses bpftrace and may ask sudo for the tracer only; the wrapped
   command still runs as the original user.
@@ -97,6 +100,24 @@ run_command_background() {
   cmd_pid=$!
 }
 
+run_command_background_gated() {
+  local gate=$1
+  shift
+
+  # Start a tiny bash shim that waits on a private FIFO, then execs the wrapped
+  # command in the same PID. This gives the macOS sampler a stable root PID
+  # before the command can start doing network I/O.
+  if [ -t 0 ] && [ -r /dev/tty ]; then
+    bash -c 'gate=$1; shift; IFS= read -r _ < "$gate"; exec "$@"' \
+      "$prog-runner" "$gate" "$@" </dev/tty &
+  else
+    bash -c 'gate=$1; shift; IFS= read -r _ < "$gate"; exec "$@"' \
+      "$prog-runner" "$gate" "$@" &
+  fi
+
+  cmd_pid=$!
+}
+
 wait_for_command() {
   local rc
 
@@ -128,22 +149,60 @@ descendant_pids() {
   done
 }
 
+default_interface() {
+  route -n get default 2>/dev/null | awk '/interface:/ { print $2; exit }'
+}
+
+interface_bytes() {
+  local iface=$1
+
+  netstat -ibn | awk -v iface="$iface" '
+    $1 == iface && $3 ~ /^<Link#/ {
+      print $7 + 0, $10 + 0
+      found = 1
+      exit
+    }
+    END {
+      if (!found) print "0 0"
+    }
+  '
+}
+
 run_macos() {
   if ! command -v nettop >/dev/null 2>&1; then
     echo "$prog: nettop not found; running unmeasured" >&2
     exec "$@"
   fi
 
-  local nt_out sampler_pid cmd_pid exit_code samples rx_tx rx tx
+  local nt_out command_gate sampler_pid cmd_pid exit_code samples rx_tx rx tx
+  local iface iface_before iface_after iface_rx_before iface_tx_before
+  local iface_rx_after iface_tx_after iface_rx_delta iface_tx_delta fallback_used
 
   nt_out=$(tmpfile) || {
     echo "$prog: mktemp failed; running unmeasured" >&2
     exec "$@"
   }
 
-  trap 'rm -f "$nt_out" 2>/dev/null' EXIT
+  command_gate=$(tmpfile) || {
+    echo "$prog: mktemp failed; running unmeasured" >&2
+    exec "$@"
+  }
+  rm -f "$command_gate"
+  if ! mkfifo "$command_gate"; then
+    echo "$prog: mkfifo failed; running unmeasured" >&2
+    rm -f "$nt_out" 2>/dev/null
+    exec "$@"
+  fi
 
-  run_command_background "$@"
+  trap 'rm -f "$nt_out" "$command_gate" 2>/dev/null' EXIT
+
+  run_command_background_gated "$command_gate" "$@"
+
+  iface=$(default_interface)
+  if [ -n "$iface" ]; then
+    iface_before=$(interface_bytes "$iface")
+    read -r iface_rx_before iface_tx_before <<<"$iface_before"
+  fi
 
   # Use repeated one-shot CSV samples. In infinite logging mode (-L 0), nettop
   # can leave redirected output empty when it is killed after the command exits.
@@ -152,8 +211,8 @@ run_macos() {
   #   -P       per-process summary, not per-socket rows
   #   -x       raw integer byte counters
   #   -n       avoid DNS/service lookups while sampling
-  #   -L 1     CSV logging mode, one flushed sample per invocation
-  #   -s 1     portable one-second interval accepted by macOS nettop
+  #   -L 1     CSV logging mode, one immediate flushed snapshot per invocation
+  #   -s 1     portable integer interval accepted by macOS nettop
   #   -p PID   track one process; repeat for descendants discovered below
   #   -J ...   output only the columns we parse
   (
@@ -170,17 +229,19 @@ run_macos() {
 
       nettop "${nettop_args[@]}" >>"$nt_out" 2>/dev/null || true
 
-      # Keep the normal sample cadence at one second, but make the pause
-      # interruptible so the wrapper does not wait up to a full extra second
-      # after the command has exited.
-      i=0
-      while [ "$i" -lt 10 ] && kill -0 "$cmd_pid" 2>/dev/null; do
-        sleep 0.1
-        i=$((i + 1))
-      done
+      # nettop -L 1 returns a current snapshot immediately. Poll quickly so
+      # short-lived downloader children, such as Homebrew's fetch helpers, are
+      # less likely to appear and disappear between samples.
+      kill -0 "$cmd_pid" 2>/dev/null && sleep 0.1
     done
   ) &
   sampler_pid=$!
+
+  # Release the command after the sampler process exists. The sampler may still
+  # miss extremely short-lived children, but this removes the larger race where
+  # the wrapped command starts before monitoring starts at all.
+  printf '\n' >"$command_gate"
+  rm -f "$command_gate" 2>/dev/null
 
   trap forward_int INT
   trap forward_term TERM
@@ -233,8 +294,29 @@ run_macos() {
 
   read -r samples rx tx <<<"$rx_tx"
 
-  if [ "${samples:-0}" -eq 0 ]; then
-    echo "$prog: no samples captured (process tree finished before nettop's 1s sample tick)" >&2
+  fallback_used=0
+  if [ -n "${iface:-}" ]; then
+    iface_after=$(interface_bytes "$iface")
+    read -r iface_rx_after iface_tx_after <<<"$iface_after"
+
+    iface_rx_delta=$((iface_rx_after - ${iface_rx_before:-0}))
+    iface_tx_delta=$((iface_tx_after - ${iface_tx_before:-0}))
+    [ "$iface_rx_delta" -lt 0 ] && iface_rx_delta=0
+    [ "$iface_tx_delta" -lt 0 ] && iface_tx_delta=0
+
+    if [ "$iface_rx_delta" -gt 65536 ] &&
+      [ "$iface_rx_delta" -gt $((${rx:-0} + 65536)) ] &&
+      { [ "${rx:-0}" -eq 0 ] || [ "$iface_rx_delta" -gt $((${rx:-0} * 2)) ]; }; then
+      rx=$iface_rx_delta
+      tx=$iface_tx_delta
+      fallback_used=1
+    fi
+  fi
+
+  if [ "$fallback_used" -eq 1 ]; then
+    echo "$prog: process samples undercounted received bytes; using $iface interface delta" >&2
+  elif [ "${samples:-0}" -eq 0 ]; then
+    echo "$prog: no samples captured (process tree finished between nettop polls)" >&2
   fi
 
   print_summary "${rx:-0}" "${tx:-0}"
