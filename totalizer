@@ -1,20 +1,30 @@
 #!/usr/bin/env bash
 # =============================================================================
-# nettotalizer - wrap a command and report network bytes transferred.
-#
+# totalizer - wrap a command and report network bytes transferred.
+# -----------------------------------------------------------------------------
 # Usage:
-#   nettotalizer <command> [args...]
+#   totalizer <command> [args...]
+#
+# Example:
+#   totalizer curl -sS -o /dev/null https://example.com/file.tar.gz
 #
 # Output goes to stderr:
 #   [net:     ↓1.2MB ↑45KB]
 #
-# Notes:
+# The wrapped command's stdout, stderr, stdin, and exit code are passed through.
+#
+# Platforms:
 #   macOS uses nettop. It measures only the wrapped PID, not child processes.
 #   Linux uses bpftrace. It measures the wrapped PID and descendants forked
 #   after bpftrace attaches. Only bpftrace runs under sudo; the command does not.
 #
-# These are socket payload bytes, not full interface bytes. Headers,
-# retransmits, and lower-level link overhead are not counted.
+# Limitations:
+#   These are socket payload bytes, not full interface bytes. Headers,
+#   retransmits, and lower-level link overhead are not counted.
+#
+#   macOS nettop samples at whole-second intervals. Very fast commands can
+#   finish before the first sample, in which case totalizer reports 0B and
+#   warns that no sample was captured.
 # =============================================================================
 
 set -u
@@ -26,6 +36,19 @@ usage() {
 Usage: $prog <command> [args...]
 
 Wrap a command and report socket-level network bytes transferred.
+
+Examples:
+  $prog curl -sS -o /dev/null https://example.com/file.tar.gz
+  $prog git fetch
+
+Output is written to stderr and the wrapped command's exit code is preserved.
+
+Notes:
+  macOS uses nettop and samples at whole-second intervals, so very short
+  commands may finish before a sample is captured.
+
+  Linux uses bpftrace and may ask sudo for the tracer only; the wrapped
+  command still runs as the original user.
 EOF
   exit 64
 }
@@ -57,7 +80,7 @@ print_summary() {
 }
 
 tmpfile() {
-  mktemp "${TMPDIR:-/tmp}/nettotalizer.XXXXXX"
+  mktemp "${TMPDIR:-/tmp}/${prog}.XXXXXX"
 }
 
 run_command_background() {
@@ -98,7 +121,7 @@ run_macos() {
     exec "$@"
   fi
 
-  local nt_out sampler_pid cmd_pid exit_code rx_tx rx tx
+  local nt_out sampler_pid cmd_pid exit_code samples rx_tx rx tx
 
   nt_out=$(tmpfile) || {
     echo "$prog: mktemp failed; running unmeasured" >&2
@@ -112,15 +135,27 @@ run_macos() {
   # Use repeated one-shot CSV samples. In infinite logging mode (-L 0), nettop
   # can leave redirected output empty when it is killed after the command exits.
   #
-  # -P gives one row per process instead of per socket.
-  # -x keeps byte values as plain integers.
-  # -n avoids DNS/service-name lookups while sampling.
-  # -s 1 uses the portable one-second interval accepted by macOS nettop.
+  # nettop flags:
+  #   -P       per-process summary, not per-socket rows
+  #   -x       raw integer byte counters
+  #   -n       avoid DNS/service lookups while sampling
+  #   -L 1     CSV logging mode, one flushed sample per invocation
+  #   -s 1     portable one-second interval accepted by macOS nettop
+  #   -p PID   track only the wrapped process
+  #   -J ...   output only the columns we parse
   (
     while kill -0 "$cmd_pid" 2>/dev/null; do
       nettop -n -P -x -L 1 -s 1 -p "$cmd_pid" -J bytes_in,bytes_out \
         >>"$nt_out" 2>/dev/null || true
-      sleep 1
+
+      # Keep the normal sample cadence at one second, but make the pause
+      # interruptible so the wrapper does not wait up to a full extra second
+      # after the command has exited.
+      i=0
+      while [ "$i" -lt 10 ] && kill -0 "$cmd_pid" 2>/dev/null; do
+        sleep 0.1
+        i=$((i + 1))
+      done
     done
   ) &
   sampler_pid=$!
@@ -133,6 +168,9 @@ run_macos() {
 
   wait "$sampler_pid" 2>/dev/null || true
 
+  # Count data rows separately from byte totals so a true zero-transfer command
+  # can be distinguished from a command that finished before nettop captured any
+  # sample at all.
   rx_tx=$(awk -F',' '
     # nettop CSV headers look like:
     #   ,bytes_in,bytes_out,
@@ -147,6 +185,7 @@ run_macos() {
     }
 
     in_col && out_col && $1 != "" {
+      samples++
       rx = $in_col + 0
       tx = $out_col + 0
 
@@ -156,12 +195,15 @@ run_macos() {
     }
 
     END {
-      printf "%d %d\n", max_rx + 0, max_tx + 0
+      printf "%d %d %d\n", samples + 0, max_rx + 0, max_tx + 0
     }
   ' "$nt_out")
 
-  rx=${rx_tx%% *}
-  tx=${rx_tx#* }
+  read -r samples rx tx <<<"$rx_tx"
+
+  if [ "${samples:-0}" -eq 0 ]; then
+    echo "$prog: no samples captured (command finished before nettop's 1s sample tick)" >&2
+  fi
 
   print_summary "${rx:-0}" "${tx:-0}"
   exit "$exit_code"
