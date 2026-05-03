@@ -1,0 +1,280 @@
+#!/usr/bin/env bash
+# =============================================================================
+# nettotalizer - wrap a command and report network bytes transferred.
+#
+# Usage:
+#   nettotalizer <command> [args...]
+#
+# Output goes to stderr:
+#   [net:     ↓1.2MB ↑45KB]
+#
+# Notes:
+#   macOS uses nettop. It measures only the wrapped PID, not child processes.
+#   Linux uses bpftrace. It measures the wrapped PID and descendants forked
+#   after bpftrace attaches. Only bpftrace runs under sudo; the command does not.
+#
+# These are socket payload bytes, not full interface bytes. Headers,
+# retransmits, and lower-level link overhead are not counted.
+# =============================================================================
+
+set -u
+
+prog=${0##*/}
+
+usage() {
+  cat >&2 <<EOF
+Usage: $prog <command> [args...]
+
+Wrap a command and report socket-level network bytes transferred.
+EOF
+  exit 64
+}
+
+case "${1:-}" in
+  ""|-h|--help) usage ;;
+esac
+
+format_bytes() {
+  local b=$1
+
+  if [ "$b" -lt 1024 ]; then
+    printf '%dB' "$b"
+  elif [ "$b" -lt 1048576 ]; then
+    awk -v x="$b" 'BEGIN { printf "%.1fKB", x / 1024 }'
+  elif [ "$b" -lt 1073741824 ]; then
+    awk -v x="$b" 'BEGIN { printf "%.1fMB", x / 1048576 }'
+  else
+    awk -v x="$b" 'BEGIN { printf "%.2fGB", x / 1073741824 }'
+  fi
+}
+
+print_summary() {
+  local rx=${1:-0}
+  local tx=${2:-0}
+
+  printf '\033[39m[\033[2mnet:\033[22m     ↓%s ↑%s]\033[0m\n' \
+    "$(format_bytes "$rx")" "$(format_bytes "$tx")" >&2
+}
+
+tmpfile() {
+  mktemp "${TMPDIR:-/tmp}/nettotalizer.XXXXXX"
+}
+
+run_command_background() {
+  # Keep stdin attached when possible. This still is not a full PTY/job-control
+  # wrapper, but it avoids breaking simple commands that inspect stdin.
+  if [ -t 0 ] && [ -r /dev/tty ]; then
+    "$@" </dev/tty &
+  else
+    "$@" &
+  fi
+
+  cmd_pid=$!
+}
+
+wait_for_command() {
+  local rc
+
+  # A trap can interrupt wait while the child is still alive. Keep waiting until
+  # the child is actually gone, then return its real exit status.
+  while true; do
+    wait "$cmd_pid"
+    rc=$?
+    kill -0 "$cmd_pid" 2>/dev/null || return "$rc"
+  done
+}
+
+forward_int() {
+  [ -n "${cmd_pid:-}" ] && kill -INT "$cmd_pid" 2>/dev/null
+}
+
+forward_term() {
+  [ -n "${cmd_pid:-}" ] && kill -TERM "$cmd_pid" 2>/dev/null
+}
+
+run_macos() {
+  if ! command -v nettop >/dev/null 2>&1; then
+    echo "$prog: nettop not found; running unmeasured" >&2
+    exec "$@"
+  fi
+
+  local nt_out sampler_pid cmd_pid exit_code rx_tx rx tx
+
+  nt_out=$(tmpfile) || {
+    echo "$prog: mktemp failed; running unmeasured" >&2
+    exec "$@"
+  }
+
+  trap 'rm -f "$nt_out" 2>/dev/null' EXIT
+
+  run_command_background "$@"
+
+  # Use repeated one-shot CSV samples. In infinite logging mode (-L 0), nettop
+  # can leave redirected output empty when it is killed after the command exits.
+  #
+  # -P gives one row per process instead of per socket.
+  # -x keeps byte values as plain integers.
+  # -n avoids DNS/service-name lookups while sampling.
+  # -s 1 uses the portable one-second interval accepted by macOS nettop.
+  (
+    while kill -0 "$cmd_pid" 2>/dev/null; do
+      nettop -n -P -x -L 1 -s 1 -p "$cmd_pid" -J bytes_in,bytes_out \
+        >>"$nt_out" 2>/dev/null || true
+      sleep 1
+    done
+  ) &
+  sampler_pid=$!
+
+  trap forward_int INT
+  trap forward_term TERM
+
+  wait_for_command
+  exit_code=$?
+
+  wait "$sampler_pid" 2>/dev/null || true
+
+  rx_tx=$(awk -F',' '
+    # nettop CSV headers look like:
+    #   ,bytes_in,bytes_out,
+    #
+    # Capture column positions from the header instead of assuming fixed indexes.
+    /bytes_in|bytes_out/ {
+      for (i = 1; i <= NF; i++) {
+        if ($i == "bytes_in") in_col = i
+        if ($i == "bytes_out") out_col = i
+      }
+      next
+    }
+
+    in_col && out_col && $1 != "" {
+      rx = $in_col + 0
+      tx = $out_col + 0
+
+      # Counters are cumulative, so the largest value seen is the final total.
+      if (rx > max_rx) max_rx = rx
+      if (tx > max_tx) max_tx = tx
+    }
+
+    END {
+      printf "%d %d\n", max_rx + 0, max_tx + 0
+    }
+  ' "$nt_out")
+
+  rx=${rx_tx%% *}
+  tx=${rx_tx#* }
+
+  print_summary "${rx:-0}" "${tx:-0}"
+  exit "$exit_code"
+}
+
+
+run_linux() {
+  if ! command -v bpftrace >/dev/null 2>&1; then
+    echo "$prog: bpftrace not found; running unmeasured" >&2
+    exec "$@"
+  fi
+
+  local bt_out bt_pid cmd_pid exit_code rx tx sudo_cmd
+
+  bt_out=$(tmpfile) || {
+    echo "$prog: mktemp failed; running unmeasured" >&2
+    exec "$@"
+  }
+
+  trap 'rm -f "$bt_out" 2>/dev/null' EXIT
+
+  sudo_cmd=
+  if [ "$(id -u)" -ne 0 ]; then
+    if ! command -v sudo >/dev/null 2>&1; then
+      echo "$prog: bpftrace requires root and sudo is unavailable; running unmeasured" >&2
+      exec "$@"
+    fi
+
+    # Authenticate before launching the measured command. This avoids counting
+    # time spent at a sudo prompt and keeps the wrapped command unprivileged.
+    if ! sudo -v; then
+      echo "$prog: sudo authentication failed; running unmeasured" >&2
+      exec "$@"
+    fi
+
+    sudo_cmd=sudo
+  fi
+
+  run_command_background "$@"
+
+  local bt_script='
+tracepoint:sched:sched_process_fork
+/args->parent_pid == $1 || @kids[args->parent_pid]/
+{
+  @kids[args->child_pid] = 1;
+}
+
+kretprobe:tcp_sendmsg /retval > 0 && (pid == $1 || @kids[pid])/
+{
+  @tx += retval;
+}
+
+kretprobe:tcp_recvmsg /retval > 0 && (pid == $1 || @kids[pid])/
+{
+  @rx += retval;
+}
+
+kretprobe:udp_sendmsg /retval > 0 && (pid == $1 || @kids[pid])/
+{
+  @tx += retval;
+}
+
+kretprobe:udp_recvmsg /retval > 0 && (pid == $1 || @kids[pid])/
+{
+  @rx += retval;
+}
+
+kretprobe:udpv6_sendmsg /retval > 0 && (pid == $1 || @kids[pid])/
+{
+  @tx += retval;
+}
+
+kretprobe:udpv6_recvmsg /retval > 0 && (pid == $1 || @kids[pid])/
+{
+  @rx += retval;
+}
+
+END
+{
+  printf("NETTOTALIZER_RX %lu\n", @rx);
+  printf("NETTOTALIZER_TX %lu\n", @tx);
+  clear(@kids);
+  clear(@rx);
+  clear(@tx);
+}
+'
+
+  # -p ties bpftrace to the command lifetime on versions that support auto-exit.
+  # We still send SIGINT after wait so END reliably prints totals.
+  $sudo_cmd bpftrace -q -e "$bt_script" -p "$cmd_pid" "$cmd_pid" >"$bt_out" &
+  bt_pid=$!
+
+  trap forward_int INT
+  trap forward_term TERM
+
+  wait_for_command
+  exit_code=$?
+
+  kill -INT "$bt_pid" 2>/dev/null || true
+  wait "$bt_pid" 2>/dev/null || true
+
+  rx=$(awk '/^NETTOTALIZER_RX / { value = $2 } END { print value + 0 }' "$bt_out")
+  tx=$(awk '/^NETTOTALIZER_TX / { value = $2 } END { print value + 0 }' "$bt_out")
+
+  print_summary "${rx:-0}" "${tx:-0}"
+  exit "$exit_code"
+}
+
+case "$(uname -s)" in
+  Darwin) run_macos "$@" ;;
+  Linux)  run_linux "$@" ;;
+  *)
+    echo "$prog: unsupported platform $(uname -s); running unmeasured" >&2
+    exec "$@"
+    ;;
+esac
