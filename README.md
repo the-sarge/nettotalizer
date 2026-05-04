@@ -21,7 +21,8 @@ nettotalizer: received=5.3KB sent=831B total=6.1KB
 
 On macOS, it uses the system `nettop` command and polls the wrapped process tree.
 
-On Linux, it uses `bpftrace` to trace socket send and receive activity.
+On Linux, it uses [`bpftrace`](https://github.com/bpftrace/bpftrace) to trace
+socket send and receive activity.
 `bpftrace` must be installed and able to access kernel tracing facilities:
 
 ```sh
