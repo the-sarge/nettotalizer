@@ -42,7 +42,7 @@ socket byte accounting. The macOS backend works around this with three tricks:
   so the command's PID is captured before any network I/O can begin.
 - Once the sampler is attached, the wrapper opens the FIFO and the shim
   `exec`s the real command in the same PID — no attach race.
-- Every ~100 ms it walks the live process tree (including descendants found
+- Every ~ 100 ms it walks the live process tree (including descendants found
   via `pgrep -P`) and asks `nettop` for a one-shot CSV snapshot of every PID.
 
 If process-scoped totals look suspiciously low compared with the default
@@ -121,6 +121,20 @@ received 5.3KB
 sent 831B
 ```
 
+If you want to combine `nettotalizer` with `time`, you should wrap `nettotalizer` with `time`, and not the other way around:
+
+```sh
+time -p nettotalizer curl -fL https://example.com/file.tar.gz -o file.tar.gz
+```
+```text
+total 433.6MB
+received 414.5MB
+sent 19.1MB
+real 57.27
+user 7.90
+sys 4.08
+```
+
 ## Testing
 
 Local smoke tests:
@@ -165,7 +179,7 @@ in the process-scoped totals.
 
 On **macOS**, the backend is polling-based:
 
-- Commands shorter than ~1 second can finish before `nettop`'s first sample.
+- Commands shorter than ~ 1 second can finish before `nettop`'s first sample.
   When this happens, `nettotalizer` prints a `no samples captured` warning
   and reports zero — better that than a silent zero with no explanation.
 - Very short-lived child processes can fork and exit between 100 ms polls,
@@ -191,3 +205,7 @@ monitoring of a host or interface, use tools like `iftop`, `bmon`, or
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+## Thanks
+
+I appreciate everyone who has contributed to building this amazing world of compute we all now benefit from, and maybe especially those who pioneered free/open source, early Unix/BSD, and the BBS glory days. 
