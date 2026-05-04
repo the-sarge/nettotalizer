@@ -187,3 +187,7 @@ warning.
 command's bytes-transferred over its lifetime, then exits. For continuous
 monitoring of a host or interface, use tools like `iftop`, `bmon`, or
 `nethogs`.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
