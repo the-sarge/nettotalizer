@@ -116,12 +116,12 @@ run_command_background_gated() {
   local gate=$1
   shift
 
-  # Used by the macOS path. A normal background launch lets fast commands start
-  # doing network I/O before nettop has even seen their PID. Instead, start a
-  # tiny bash shim that blocks on a private FIFO. The wrapper starts the sampler,
+  # Used by the measured paths that need a stable root PID before the real
+  # command starts. A normal background launch lets fast commands start doing
+  # network I/O before the sampler/tracer has attached. Instead, start a tiny
+  # bash shim that blocks on a private FIFO. The wrapper starts measurement,
   # writes one byte to the FIFO, and then the shim `exec`s the real command in
-  # the same PID. That removes the root-process attach race. It does not make
-  # descendant tracking perfect; children can still fork and exit between polls.
+  # the same PID.
   if [ -t 0 ] && [ -r /dev/tty ]; then
     bash -c 'gate=$1; shift; IFS= read -r _ < "$gate"; exec "$@"' \
       "$prog-runner" "$gate" "$@" </dev/tty &
@@ -404,7 +404,8 @@ run_linux() {
     exec "$@"
   fi
 
-  local bt_out bt_pid cmd_pid exit_code rx tx sudo_cmd
+  local bt_out command_gate bt_pid cmd_pid exit_code rx tx sudo_cmd
+  local ready i
 
   # Linux strategy:
   #
@@ -423,7 +424,19 @@ run_linux() {
     exec "$@"
   }
 
-  trap 'rm -f "$bt_out" 2>/dev/null' EXIT
+  command_gate=$(tmpfile) || {
+    echo "$prog: mktemp failed; running unmeasured" >&2
+    rm -f "$bt_out" 2>/dev/null
+    exec "$@"
+  }
+  rm -f "$command_gate"
+  if ! mkfifo "$command_gate"; then
+    echo "$prog: mkfifo failed; running unmeasured" >&2
+    rm -f "$bt_out" 2>/dev/null
+    exec "$@"
+  fi
+
+  trap 'rm -f "$bt_out" "$command_gate" 2>/dev/null' EXIT
 
   sudo_cmd=
   if [ "$(id -u)" -ne 0 ]; then
@@ -442,45 +455,50 @@ run_linux() {
     sudo_cmd=sudo
   fi
 
-  run_command_background "$@"
+  run_command_background_gated "$command_gate" "$@"
 
   # The bpftrace script uses positional argument $1 for the root PID. @kids is
   # populated from sched_process_fork so grandchildren are included after their
   # parents have been marked. kretprobes are used instead of entry probes because
   # the positive return value is the number of bytes actually transferred.
   local bt_script='
+BEGIN
+{
+  printf("NETTOTALIZER_READY\n");
+}
+
 tracepoint:sched:sched_process_fork
 /args->parent_pid == $1 || @kids[args->parent_pid]/
 {
   @kids[args->child_pid] = 1;
 }
 
-kretprobe:tcp_sendmsg /retval > 0 && (pid == $1 || @kids[pid])/
+kretprobe:tcp_sendmsg /retval > 0 && retval <= 2147483647 && (pid == $1 || @kids[pid])/
 {
   @tx += retval;
 }
 
-kretprobe:tcp_recvmsg /retval > 0 && (pid == $1 || @kids[pid])/
+kretprobe:tcp_recvmsg /retval > 0 && retval <= 2147483647 && (pid == $1 || @kids[pid])/
 {
   @rx += retval;
 }
 
-kretprobe:udp_sendmsg /retval > 0 && (pid == $1 || @kids[pid])/
+kretprobe:udp_sendmsg /retval > 0 && retval <= 2147483647 && (pid == $1 || @kids[pid])/
 {
   @tx += retval;
 }
 
-kretprobe:udp_recvmsg /retval > 0 && (pid == $1 || @kids[pid])/
+kretprobe:udp_recvmsg /retval > 0 && retval <= 2147483647 && (pid == $1 || @kids[pid])/
 {
   @rx += retval;
 }
 
-kretprobe:udpv6_sendmsg /retval > 0 && (pid == $1 || @kids[pid])/
+kretprobe:udpv6_sendmsg /retval > 0 && retval <= 2147483647 && (pid == $1 || @kids[pid])/
 {
   @tx += retval;
 }
 
-kretprobe:udpv6_recvmsg /retval > 0 && (pid == $1 || @kids[pid])/
+kretprobe:udpv6_recvmsg /retval > 0 && retval <= 2147483647 && (pid == $1 || @kids[pid])/
 {
   @rx += retval;
 }
@@ -499,6 +517,27 @@ END
   # We still send SIGINT after wait so END reliably prints totals.
   $sudo_cmd bpftrace -q -e "$bt_script" -p "$cmd_pid" "$cmd_pid" >"$bt_out" &
   bt_pid=$!
+
+  ready=0
+  # Older bpftrace builds can take several seconds to compile and attach the
+  # first time they run on a fresh host. Wait long enough to keep fast commands
+  # gated until the tracer has really started.
+  for ((i = 0; i < 600; i++)); do
+    if grep -q '^NETTOTALIZER_READY$' "$bt_out" 2>/dev/null; then
+      ready=1
+      break
+    fi
+
+    kill -0 "$bt_pid" 2>/dev/null || break
+    sleep 0.05
+  done
+
+  if [ "$ready" -ne 1 ]; then
+    echo "$prog: bpftrace did not become ready before command start; measurement may undercount" >&2
+  fi
+
+  printf '\n' >"$command_gate"
+  rm -f "$command_gate" 2>/dev/null
 
   trap forward_int INT
   trap forward_term TERM
