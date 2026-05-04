@@ -8,7 +8,7 @@
 # Example:
 #   totalizer curl -sS -o /dev/null https://example.com/file.tar.gz
 #
-# Output goes to stderr:
+# Output goes to stderr so stdout remains safe for pipes:
 #   [net:     ↓1.2MB ↑45KB]
 #
 # The wrapped command's stdout, stderr, stdin, and exit code are passed through.
@@ -23,11 +23,14 @@
 #   These are socket payload bytes, not full interface bytes. Headers,
 #   retransmits, and lower-level link overhead are not counted.
 #
-#   macOS nettop is polled against the visible process tree. Very fast commands
-#   or short-lived child processes can still finish between polls, in which case
-#   totalizer may undercount. If process sampling sees no received bytes but the
-#   default interface did, totalizer falls back to that interface delta; this can
-#   include unrelated system traffic and counts interface bytes, not socket bytes.
+#   macOS has no simple, stable, unprivileged event stream for per-process socket
+#   byte accounting. The macOS backend therefore polls nettop against the visible
+#   process tree. That is good for long-lived children, but short-lived download
+#   helpers can still finish between polls. When process samples obviously
+#   undercount receive bytes, totalizer may fall back to the default-interface
+#   byte delta. That catches tools like Homebrew better, but it is an estimate:
+#   it can include unrelated system traffic and counts interface bytes, not just
+#   socket payload bytes.
 # =============================================================================
 
 set -u
@@ -62,6 +65,9 @@ case "${1:-}" in
   ""|-h|--help) usage ;;
 esac
 
+# Render integer byte counts using the compact style expected by the shell
+# prompt/status output. Bash has no portable floating point, so awk handles the
+# fractional KB/MB/GB cases.
 format_bytes() {
   local b=$1
 
@@ -76,6 +82,8 @@ format_bytes() {
   fi
 }
 
+# Keep the summary on stderr because the wrapped command's stdout may be part of
+# a pipeline. The ANSI sequence matches the surrounding shell status style.
 print_summary() {
   local rx=${1:-0}
   local tx=${2:-0}
@@ -84,13 +92,17 @@ print_summary() {
     "$(format_bytes "$rx")" "$(format_bytes "$tx")" >&2
 }
 
+# Use the visible program name in temp paths so traces from `totalizer` and any
+# symlink/alias are easy to recognize while debugging.
 tmpfile() {
   mktemp "${TMPDIR:-/tmp}/${prog}.XXXXXX"
 }
 
 run_command_background() {
-  # Keep stdin attached when possible. This still is not a full PTY/job-control
-  # wrapper, but it avoids breaking simple commands that inspect stdin.
+  # Used by the Linux path. We need a PID before starting the tracer, so the
+  # wrapped command runs in the background. Keeping stdin attached to /dev/tty
+  # preserves simple stdin consumers, but this is still not a real PTY/job-control
+  # wrapper; full-screen or interactive programs remain out of scope.
   if [ -t 0 ] && [ -r /dev/tty ]; then
     "$@" </dev/tty &
   else
@@ -104,9 +116,12 @@ run_command_background_gated() {
   local gate=$1
   shift
 
-  # Start a tiny bash shim that waits on a private FIFO, then execs the wrapped
-  # command in the same PID. This gives the macOS sampler a stable root PID
-  # before the command can start doing network I/O.
+  # Used by the macOS path. A normal background launch lets fast commands start
+  # doing network I/O before nettop has even seen their PID. Instead, start a
+  # tiny bash shim that blocks on a private FIFO. The wrapper starts the sampler,
+  # writes one byte to the FIFO, and then the shim `exec`s the real command in
+  # the same PID. That removes the root-process attach race. It does not make
+  # descendant tracking perfect; children can still fork and exit between polls.
   if [ -t 0 ] && [ -r /dev/tty ]; then
     bash -c 'gate=$1; shift; IFS= read -r _ < "$gate"; exec "$@"' \
       "$prog-runner" "$gate" "$@" </dev/tty &
@@ -121,8 +136,9 @@ run_command_background_gated() {
 wait_for_command() {
   local rc
 
-  # A trap can interrupt wait while the child is still alive. Keep waiting until
-  # the child is actually gone, then return its real exit status.
+  # A forwarded signal can interrupt `wait` while the child is still alive. Keep
+  # waiting until the child is actually gone so the wrapper returns the wrapped
+  # command's real exit status, not the signal-interrupted wait status.
   while true; do
     wait "$cmd_pid"
     rc=$?
@@ -139,6 +155,10 @@ forward_term() {
 }
 
 descendant_pids() {
+  # Recursive pgrep walk of the current process tree. This intentionally reports
+  # only descendants that are alive at the instant of the poll; macOS has no
+  # unprivileged fork event stream here, so very short-lived children remain the
+  # main source of undercounting.
   local pid=$1
   local child
 
@@ -150,12 +170,19 @@ descendant_pids() {
 }
 
 default_interface() {
+  # Used only for the macOS fallback estimate. route(8) tells us where ordinary
+  # internet traffic is likely to leave. VPNs and split routing can make this
+  # imperfect, but it is still a useful last-resort estimate for fast downloaders.
   route -n get default 2>/dev/null | awk '/interface:/ { print $2; exit }'
 }
 
 interface_bytes() {
   local iface=$1
 
+  # Read cumulative link-layer byte counters for a single interface. We select
+  # the <Link#...> row to avoid duplicate address-family rows for the same
+  # interface. These counters include all traffic on that interface, not just the
+  # wrapped command, which is why the fallback emits an explicit warning.
   netstat -ibn | awk -v iface="$iface" '
     $1 == iface && $3 ~ /^<Link#/ {
       print $7 + 0, $10 + 0
@@ -178,11 +205,29 @@ run_macos() {
   local iface iface_before iface_after iface_rx_before iface_tx_before
   local iface_rx_after iface_tx_after iface_rx_delta iface_tx_delta fallback_used
 
+  # macOS strategy, in plain English:
+  #
+  #   1. Create a temp CSV file for nettop snapshots.
+  #   2. Create a FIFO gate and launch a bash shim that waits on it.
+  #   3. Start the sampler against the shim PID, then release the gate.
+  #   4. The shim execs the real command, preserving that PID as the root.
+  #   5. Every poll, discover currently-live descendants and ask nettop for a
+  #      one-shot CSV snapshot for every PID we know about.
+  #   6. After the command exits, sum each PID's maximum observed counters.
+  #   7. If nettop clearly missed receive traffic, optionally replace the result
+  #      with the default-interface byte delta and warn that it is an estimate.
+  #
+  # This is intentionally conservative in what it claims. The process-tree total
+  # is scoped but sampled. The interface fallback is complete for the interface
+  # interval but not scoped to the command. Neither is a perfect macOS answer.
+
   nt_out=$(tmpfile) || {
     echo "$prog: mktemp failed; running unmeasured" >&2
     exec "$@"
   }
 
+  # mktemp creates a regular file, then mkfifo needs the path to not exist. Keep
+  # the two-step flow instead of hand-rolling random names.
   command_gate=$(tmpfile) || {
     echo "$prog: mktemp failed; running unmeasured" >&2
     exec "$@"
@@ -198,6 +243,9 @@ run_macos() {
 
   run_command_background_gated "$command_gate" "$@"
 
+  # Capture the interface baseline after the gated shim exists but before the
+  # real command is released. This keeps the fallback interval aligned as closely
+  # as possible with the command's actual runtime.
   iface=$(default_interface)
   if [ -n "$iface" ]; then
     iface_before=$(interface_bytes "$iface")
@@ -220,6 +268,9 @@ run_macos() {
     local nettop_args
 
     while kill -0 "$cmd_pid" 2>/dev/null; do
+      # Rebuild the PID list every poll because package managers and git-like
+      # tools often launch short-lived helpers. nettop accepts repeated -p flags,
+      # which is the only way to ask for multiple process summaries.
       pids=$(descendant_pids "$cmd_pid")
 
       nettop_args=(-n -P -x -L 1 -s 1 -J bytes_in,bytes_out)
@@ -251,10 +302,18 @@ run_macos() {
 
   wait "$sampler_pid" 2>/dev/null || true
 
-  # Count data rows separately from byte totals so a true zero-transfer command
-  # can be distinguished from a command/process tree that finished before nettop
-  # captured any sample at all. Because the sampler can track multiple PIDs, keep
-  # a max counter per PID and sum those maxima at the end.
+  # Parse the accumulated CSV snapshots.
+  #
+  # Important details:
+  #   * nettop emits a header for each -L 1 invocation; discover columns from
+  #     headers instead of assuming a fixed layout.
+  #   * Data rows are keyed by "process-name.PID". Strip the trailing ".PID" and
+  #     key by PID so the same process is not double-counted when the gated bash
+  #     shim execs into the real command and the displayed name changes.
+  #   * Counters are cumulative per process, so the largest observed rx/tx value
+  #     for each PID is that PID's best final total.
+  #   * `samples` counts data rows. A zero sample count is different from a
+  #     sampled process with true 0B traffic, so we warn only in the former case.
   rx_tx=$(awk -F',' '
     # nettop CSV headers look like:
     #   ,bytes_in,bytes_out,
@@ -294,6 +353,21 @@ run_macos() {
 
   read -r samples rx tx <<<"$rx_tx"
 
+  # Fallback estimate:
+  #
+  # If the process-scoped sampler reports little or no receive traffic while the
+  # default interface advanced materially, prefer the interface delta. This is
+  # what makes fast Homebrew downloads produce a useful number instead of 0B.
+  #
+  # Thresholds are intentionally blunt:
+  #   * require >64KB interface RX so ordinary background chatter does not flip
+  #     tiny commands into fallback mode;
+  #   * require the interface delta to beat process RX by >64KB; and
+  #   * if process RX is nonzero, require the interface delta to be >2x process
+  #     RX so we do not replace good process data for small differences.
+  #
+  # When this triggers, print an explicit warning because the value is no longer
+  # scoped only to the process tree and includes link-layer bytes.
   fallback_used=0
   if [ -n "${iface:-}" ]; then
     iface_after=$(interface_bytes "$iface")
@@ -332,6 +406,18 @@ run_linux() {
 
   local bt_out bt_pid cmd_pid exit_code rx tx sudo_cmd
 
+  # Linux strategy:
+  #
+  #   * bpftrace gives us event-style accounting rather than polling. That is
+  #     why Linux can follow descendants more accurately than macOS here.
+  #   * The wrapped command still runs as the invoking user. Only bpftrace is
+  #     run through sudo when root privileges are needed.
+  #   * We hook fork events to maintain a descendant set, then sum positive
+  #     return values from tcp/udp send/recv kernel paths for the root PID or
+  #     any tracked child.
+  #   * This counts socket payload bytes returned by those kernel functions. It
+  #     still does not count raw sockets, AF_PACKET, or other nonstandard paths.
+
   bt_out=$(tmpfile) || {
     echo "$prog: mktemp failed; running unmeasured" >&2
     exec "$@"
@@ -358,6 +444,10 @@ run_linux() {
 
   run_command_background "$@"
 
+  # The bpftrace script uses positional argument $1 for the root PID. @kids is
+  # populated from sched_process_fork so grandchildren are included after their
+  # parents have been marked. kretprobes are used instead of entry probes because
+  # the positive return value is the number of bytes actually transferred.
   local bt_script='
 tracepoint:sched:sched_process_fork
 /args->parent_pid == $1 || @kids[args->parent_pid]/
@@ -419,6 +509,9 @@ END
   kill -INT "$bt_pid" 2>/dev/null || true
   wait "$bt_pid" 2>/dev/null || true
 
+  # Use the last printed values in case bpftrace emits multiple lines around
+  # shutdown. Missing values intentionally collapse to 0 so measurement failure
+  # does not change the wrapped command's exit status.
   rx=$(awk '/^NETTOTALIZER_RX / { value = $2 } END { print value + 0 }' "$bt_out")
   tx=$(awk '/^NETTOTALIZER_TX / { value = $2 } END { print value + 0 }' "$bt_out")
 
