@@ -57,6 +57,23 @@ The summary is written to stderr, so stdout can still be redirected or piped:
 nettotalizer curl -sS https://example.com/data.json | jq .
 ```
 
+## Testing
+
+Run the local smoke tests:
+
+```sh
+tests/smoke.sh
+```
+
+Run the Linux integration test in Docker:
+
+```sh
+tests/linux-docker.sh
+```
+
+The Docker test uses a privileged Linux container with the host PID namespace so
+`bpftrace` can observe the wrapped process and descendants.
+
 ## How It Works
 
 macOS does not provide a simple, stable, unprivileged event stream for
