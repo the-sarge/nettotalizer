@@ -19,10 +19,12 @@
 #
 # Known limitations (read these before trusting the numbers):
 #
-#   * On macOS, nettop is per-PID and does NOT follow children. If your
-#     command forks helpers that do the actual networking (e.g. `git push`
-#     spawning `ssh`, browsers spawning render processes), their traffic
-#     is missed. For curl/wget/most HTTP clients this is fine.
+#   * On macOS, nettop is per-PID; we work around this by polling the
+#     wrapped command's process tree (`pgrep -P` recursive) and passing
+#     every descendant as a separate `-p` flag. Long-lived child
+#     processes (e.g. `git push` spawning `ssh`) are tracked. Very
+#     short-lived children that fork and exit between 100ms polls may
+#     still slip through.
 #
 #   * On Linux, the bpftrace script DOES follow fork() and tracks
 #     descendants, but only instruments the standard tcp/udp (v4 and v6)
@@ -117,18 +119,53 @@ wait_for_command() {
 forward_int()  { [ -n "${cmd_pid:-}" ] && kill -INT  "$cmd_pid" 2>/dev/null; }
 forward_term() { [ -n "${cmd_pid:-}" ] && kill -TERM "$cmd_pid" 2>/dev/null; }
 
+# Recursive pgrep walk: emit `pid` and all descendant pids, one per line.
+# Used by run_macos to feed every descendant as a separate `-p` to nettop.
+descendant_pids() {
+  local pid=$1
+  local child
+  printf '%s\n' "$pid"
+  for child in $(pgrep -P "$pid" 2>/dev/null || true); do
+    descendant_pids "$child"
+  done
+}
+
+# Like run_command_background, but the command waits on a FIFO before
+# starting. The shim has its PID assigned before any I/O happens; once
+# the sampler is attached, the caller writes to the FIFO and the shim
+# `exec`s the real command, taking over the same PID. No attach race.
+run_command_background_gated() {
+  local gate=$1
+  shift
+  if [ -t 0 ] && [ -r /dev/tty ]; then
+    bash -c 'gate=$1; shift; IFS= read -r _ < "$gate"; exec "$@"' \
+      "$prog-runner" "$gate" "$@" </dev/tty &
+  else
+    bash -c 'gate=$1; shift; IFS= read -r _ < "$gate"; exec "$@"' \
+      "$prog-runner" "$gate" "$@" &
+  fi
+  cmd_pid=$!
+}
+
 # =============================================================================
 # macOS implementation: nettop
 # -----------------------------------------------------------------------------
 # Strategy:
-#   1. Background the wrapped command, capture its PID.
-#   2. Repeatedly run nettop in single-sample CSV mode (`-L 1`) in a loop
-#      while the command is alive, appending to a temp file.
-#   3. Forward SIGINT/SIGTERM so Ctrl+C reaches the wrapped command.
-#   4. Wait for the command to exit, capture its exit code.
-#   5. Parse the CSV: read column positions from the header row, then
-#      take the maximum bytes_in / bytes_out seen across all samples
-#      (counters are monotonic, so the last good reading is the largest).
+#   1. Stage the wrapped command in a bash shim that blocks on a FIFO,
+#      so we know its PID before any I/O happens.
+#   2. Start the sampler subshell, then write a byte to the FIFO. The
+#      shim `exec`s the real command, taking over the same PID — the
+#      sampler can't race the command's first network call.
+#   3. Each ~100ms tick: walk the process tree (`pgrep -P` recursive),
+#      pass every descendant as a separate `-p` flag to `nettop -L 1`,
+#      append the CSV snapshot to a temp file.
+#   4. Forward SIGINT/SIGTERM so Ctrl+C reaches the wrapped command.
+#   5. Wait for the command to exit, capture its exit code.
+#   6. Parse the CSV: discover column positions from the header, keep
+#      a per-PID-key max (counters are monotonic, last value is largest),
+#      and sum the maxima across keys for the final total. The bare-PID
+#      key consolidates the same PID across the bash-shim → exec name
+#      change.
 #
 # Why one-shot samples in a loop instead of `nettop -L 0`: in infinite
 # logging mode, nettop block-buffers stdout and the buffered tail can be
@@ -141,29 +178,61 @@ run_macos() {
     exec "$@"
   fi
 
-  local nt_out sampler_pid cmd_pid exit_code rx_tx rx tx
+  local nt_out command_gate sampler_pid cmd_pid exit_code samples rx_tx rx tx
 
   nt_out=$(tmpfile) || { echo "$prog: mktemp failed; running unmeasured" >&2; exec "$@"; }
-  trap 'rm -f "$nt_out" 2>/dev/null' EXIT
 
-  run_command_background "$@"
+  # Build a private FIFO the shim can block on. mktemp gives us a unique
+  # path; we replace the regular file with a fifo at the same name.
+  command_gate=$(tmpfile) || {
+    echo "$prog: mktemp failed; running unmeasured" >&2
+    rm -f "$nt_out" 2>/dev/null
+    exec "$@"
+  }
+  rm -f "$command_gate"
+  if ! mkfifo "$command_gate"; then
+    echo "$prog: mkfifo failed; running unmeasured" >&2
+    rm -f "$nt_out" 2>/dev/null
+    exec "$@"
+  fi
+  trap 'rm -f "$nt_out" "$command_gate" 2>/dev/null' EXIT
+
+  run_command_background_gated "$command_gate" "$@"
 
   # nettop flags:
   #   -P             per-process summary (one row per pid, not per socket)
   #   -x             extended numeric output (raw bytes)
   #   -n             skip DNS/service-name lookups (faster, less noise)
-  #   -L 1           CSV logging mode, one sample then exit
-  #   -s 1           sample interval (must be integer seconds)
-  #   -p PID         track only this process
+  #   -L 1           CSV logging mode, one immediate flushed snapshot
+  #   -s 1           portable integer interval accepted by macOS nettop
+  #   -p PID         track this process; repeated for each descendant
   #   -J ...         request these specific columns
   (
+    local pids pid
+    local nettop_args
     while kill -0 "$cmd_pid" 2>/dev/null; do
-      nettop -n -P -x -L 1 -s 1 -p "$cmd_pid" -J bytes_in,bytes_out \
-        >>"$nt_out" 2>/dev/null || true
-      sleep 1
+      pids=$(descendant_pids "$cmd_pid")
+
+      nettop_args=(-n -P -x -L 1 -s 1 -J bytes_in,bytes_out)
+      for pid in $pids; do
+        nettop_args+=(-p "$pid")
+      done
+
+      nettop "${nettop_args[@]}" >>"$nt_out" 2>/dev/null || true
+
+      # Poll quickly to catch short-lived children that might fork+exit
+      # between samples (e.g. git's ssh helper, package-manager fetchers).
+      kill -0 "$cmd_pid" 2>/dev/null && sleep 0.1
     done
   ) &
   sampler_pid=$!
+
+  # Sampler is up. Release the wrapped command — the shim execs the
+  # real binary, taking over the existing PID with the sampler already
+  # attached. We can drop the FIFO right after; the read on the other
+  # side has already returned.
+  printf '\n' >"$command_gate"
+  rm -f "$command_gate" 2>/dev/null
 
   trap forward_int  INT
   trap forward_term TERM
@@ -173,11 +242,12 @@ run_macos() {
 
   wait "$sampler_pid" 2>/dev/null || true
 
-  # Parse CSV: discover column indices from the header, then track the
-  # max byte counter seen on data rows. Header looks like:
-  #   ,bytes_in,bytes_out,
-  # `samples` counts data rows so we can warn when none were captured
-  # (e.g. command exited before nettop's first 1s sample).
+  # Parse CSV: discover column indices from the header. Track per-PID
+  # max byte counters (monotonic — last value is the largest). Sum
+  # maxima across keys at the end. Stripping the trailing `.PID` from
+  # the row label consolidates the same PID across the bash-shim →
+  # exec rename, and keys distinct processes apart correctly.
+  # `samples` counts data rows so we can warn when none were captured.
   rx_tx=$(awk -F',' '
     /bytes_in|bytes_out/ {
       for (i = 1; i <= NF; i++) {
@@ -188,17 +258,26 @@ run_macos() {
     }
     in_col && out_col && $1 != "" {
       samples++
+      key = $1
+      if (match(key, /\.[0-9]+$/)) { key = substr(key, RSTART + 1) }
+      seen[key] = 1
       rx = $in_col + 0; tx = $out_col + 0
-      if (rx > max_rx) max_rx = rx
-      if (tx > max_tx) max_tx = tx
+      if (rx > max_rx[key]) max_rx[key] = rx
+      if (tx > max_tx[key]) max_tx[key] = tx
     }
-    END { printf "%d %d %d\n", samples + 0, max_rx + 0, max_tx + 0 }
+    END {
+      for (key in seen) {
+        total_rx += max_rx[key]
+        total_tx += max_tx[key]
+      }
+      printf "%d %d %d\n", samples + 0, total_rx + 0, total_tx + 0
+    }
   ' "$nt_out")
 
   read -r samples rx tx <<<"$rx_tx"
 
   if [ "${samples:-0}" -eq 0 ]; then
-    echo "$prog: no samples captured (command finished before nettop's 1s sample tick)" >&2
+    echo "$prog: no samples captured (process tree finished between nettop polls)" >&2
   fi
 
   print_summary "${rx:-0}" "${tx:-0}"
