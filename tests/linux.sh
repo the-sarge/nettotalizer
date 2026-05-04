@@ -3,21 +3,6 @@ set -u
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 repo_root=$(CDPATH= cd -- "$script_dir/.." && pwd)
-image=${NETTOTALIZER_TEST_IMAGE:-ubuntu:24.04}
-
-fail() {
-  echo "not ok - $*" >&2
-  exit 1
-}
-
-command -v docker >/dev/null 2>&1 || fail "docker not found"
-
-docker run --rm -i --privileged --pid=host \
-  -v "$repo_root:/work:ro" \
-  -w /work \
-  "$image" \
-  bash -s <<'EOF'
-set -u
 
 fail() {
   echo "not ok - $*" >&2
@@ -29,9 +14,9 @@ ok() {
 }
 
 assert_eq() {
-  expected=$1
-  actual=$2
-  label=$3
+  local expected=$1
+  local actual=$2
+  local label=$3
 
   if [ "$actual" != "$expected" ]; then
     fail "$label: expected '$expected', got '$actual'"
@@ -39,8 +24,8 @@ assert_eq() {
 }
 
 assert_summary() {
-  summary=$1
-  label=$2
+  local summary=$1
+  local label=$2
 
   printf '%s\n' "$summary" | grep -Eq '^total [^ ]+$' ||
     fail "$label: summary missing total line: $summary"
@@ -51,8 +36,8 @@ assert_summary() {
 }
 
 assert_nonzero_net_summary() {
-  summary=$1
-  label=$2
+  local summary=$1
+  local label=$2
 
   assert_summary "$summary" "$label"
 
@@ -61,41 +46,56 @@ assert_nonzero_net_summary() {
   fi
 }
 
-export DEBIAN_FRONTEND=noninteractive
-apt-get update >/tmp/nettotalizer-apt-update.log ||
-  fail "apt-get update failed; see /tmp/nettotalizer-apt-update.log in container"
-apt-get install -y --no-install-recommends bpftrace curl ca-certificates \
-  >/tmp/nettotalizer-apt-install.log ||
-  fail "apt-get install failed; see /tmp/nettotalizer-apt-install.log in container"
+[ "$(uname -s)" = Linux ] || fail "Linux required"
+command -v bpftrace >/dev/null 2>&1 || fail "bpftrace not found"
+command -v curl >/dev/null 2>&1 || fail "curl not found"
 
-mountpoint -q /sys/kernel/tracing ||
-  mount -t tracefs tracefs /sys/kernel/tracing ||
-  fail "mount tracefs failed"
+sudo_cmd=
+if [ "$(id -u)" -ne 0 ]; then
+  command -v sudo >/dev/null 2>&1 || fail "sudo not found"
+  sudo -n true >/dev/null 2>&1 ||
+    fail "passwordless sudo or cached sudo credentials required"
+  sudo_cmd=sudo
+fi
+
+tracepoint_available() {
+  $sudo_cmd test -d /sys/kernel/tracing/events/sched/sched_process_fork 2>/dev/null
+}
+
+if ! tracepoint_available; then
+  $sudo_cmd mount -t tracefs tracefs /sys/kernel/tracing 2>/dev/null || true
+fi
+tracepoint_available || fail "sched_process_fork tracepoint not available"
+
+tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/nettotalizer-linux.XXXXXX") ||
+  fail "mktemp failed"
+trap 'rm -rf "$tmpdir"' EXIT
+
+cd "$repo_root" || fail "cd repo root failed"
 
 bash -n ./nettotalizer || fail "bash syntax check failed"
 ok "bash syntax"
 
 direct_summary=$(./nettotalizer curl -sS -o /dev/null https://example.com \
-  2>&1 >/tmp/nettotalizer-direct.stdout)
+  2>&1 >"$tmpdir/direct.out")
 direct_rc=$?
 assert_eq 0 "$direct_rc" "direct curl exit code"
-assert_eq "" "$(cat /tmp/nettotalizer-direct.stdout)" "direct curl stdout"
+assert_eq "" "$(cat "$tmpdir/direct.out")" "direct curl stdout"
 assert_nonzero_net_summary "$direct_summary" "direct curl"
 ok "direct curl"
 
 child_summary=$(./nettotalizer bash -lc 'curl -sS -o /dev/null https://example.com; sleep 1' \
-  2>&1 >/tmp/nettotalizer-child.stdout)
+  2>&1 >"$tmpdir/child.out")
 child_rc=$?
 assert_eq 0 "$child_rc" "child curl exit code"
-assert_eq "" "$(cat /tmp/nettotalizer-child.stdout)" "child curl stdout"
+assert_eq "" "$(cat "$tmpdir/child.out")" "child curl stdout"
 assert_nonzero_net_summary "$child_summary" "child curl"
 ok "child curl"
 
 failing_summary=$(./nettotalizer bash -lc 'exit 42' \
-  2>&1 >/tmp/nettotalizer-failing.stdout)
+  2>&1 >"$tmpdir/failing.out")
 failing_rc=$?
 assert_eq 42 "$failing_rc" "failing command exit code"
-assert_eq "" "$(cat /tmp/nettotalizer-failing.stdout)" "failing command stdout"
+assert_eq "" "$(cat "$tmpdir/failing.out")" "failing command stdout"
 assert_summary "$failing_summary" "failing command"
 ok "wrapped exit code"
-EOF
