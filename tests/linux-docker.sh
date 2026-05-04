@@ -42,10 +42,11 @@ assert_nonzero_net_summary() {
   summary=$1
   label=$2
 
-  printf '%s\n' "$summary" | grep -q 'net:' ||
-    fail "$label: summary missing net marker: $summary"
+  printf '%s\n' "$summary" |
+    grep -Eq '^nettotalizer: received=[^ ]+ sent=[^ ]+ total=[^ ]+$' ||
+    fail "$label: summary has unexpected format: $summary"
 
-  if printf '%s\n' "$summary" | grep -Eq 'net:.*0B.*0B'; then
+  if printf '%s\n' "$summary" | grep -Eq 'received=0B sent=0B total=0B'; then
     fail "$label: expected nonzero network bytes, got: $summary"
   fi
 }
@@ -85,7 +86,8 @@ failing_summary=$(./nettotalizer bash -lc 'exit 42' \
 failing_rc=$?
 assert_eq 42 "$failing_rc" "failing command exit code"
 assert_eq "" "$(cat /tmp/nettotalizer-failing.stdout)" "failing command stdout"
-printf '%s\n' "$failing_summary" | grep -q 'net:' ||
-  fail "failing command summary missing net marker: $failing_summary"
+printf '%s\n' "$failing_summary" |
+  grep -Eq '^nettotalizer: received=[^ ]+ sent=[^ ]+ total=[^ ]+$' ||
+  fail "failing command summary has unexpected format: $failing_summary"
 ok "wrapped exit code"
 EOF

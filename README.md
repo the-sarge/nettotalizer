@@ -12,7 +12,7 @@ nettotalizer git fetch
 Example summary:
 
 ```text
-[net:     ↓1.2MB ↑45KB]
+nettotalizer: received=5.3KB sent=831B total=6.1KB
 ```
 
 ## Requirements
@@ -67,6 +67,12 @@ The summary is written to stderr, so stdout can still be redirected or piped:
 
 ```sh
 nettotalizer curl -sS https://example.com/data.json | jq .
+```
+
+Summary output uses labeled fields:
+
+```text
+nettotalizer: received=5.3KB sent=831B total=6.1KB
 ```
 
 ## Testing

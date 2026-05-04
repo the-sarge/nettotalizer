@@ -9,7 +9,7 @@
 #   totalizer curl -sS -o /dev/null https://example.com/file.tar.gz
 #
 # Output goes to stderr so stdout remains safe for pipes:
-#   [net:     ↓1.2MB ↑45KB]
+#   nettotalizer: received=5.3KB sent=831B total=6.1KB
 #
 # The wrapped command's stdout, stderr, stdin, and exit code are passed through.
 #
@@ -48,6 +48,8 @@ Examples:
   $prog git fetch
 
 Output is written to stderr and the wrapped command's exit code is preserved.
+Summary format:
+  $prog: received=5.3KB sent=831B total=6.1KB
 
 Notes:
   macOS uses nettop and polls the wrapped process tree, so very short child
@@ -65,9 +67,8 @@ case "${1:-}" in
   ""|-h|--help) usage ;;
 esac
 
-# Render integer byte counts using the compact style expected by the shell
-# prompt/status output. Bash has no portable floating point, so awk handles the
-# fractional KB/MB/GB cases.
+# Render integer byte counts compactly. Bash has no portable floating point, so
+# awk handles the fractional KB/MB/GB cases.
 format_bytes() {
   local b=$1
 
@@ -83,13 +84,15 @@ format_bytes() {
 }
 
 # Keep the summary on stderr because the wrapped command's stdout may be part of
-# a pipeline. The ANSI sequence matches the surrounding shell status style.
+# a pipeline.
 print_summary() {
   local rx=${1:-0}
   local tx=${2:-0}
+  local total=$((rx + tx))
 
-  printf '\033[39m[\033[2mnet:\033[22m     ↓%s ↑%s]\033[0m\n' \
-    "$(format_bytes "$rx")" "$(format_bytes "$tx")" >&2
+  printf '%s: received=%s sent=%s total=%s\n' \
+    "$prog" "$(format_bytes "$rx")" "$(format_bytes "$tx")" \
+    "$(format_bytes "$total")" >&2
 }
 
 # Use the visible program name in temp paths so traces from `totalizer` and any
