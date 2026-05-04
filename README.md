@@ -21,9 +21,21 @@ Example summary:
 
 On macOS, it uses the system `nettop` command and polls the wrapped process tree.
 
-On Linux, it uses `bpftrace` to trace socket send and receive activity. If the
-script is not already running as root, only `bpftrace` is run through `sudo`; the
-wrapped command still runs as the original user.
+On Linux, it uses `bpftrace` to trace socket send and receive activity.
+`bpftrace` must be installed and able to access kernel tracing facilities:
+
+```sh
+# Debian/Ubuntu
+sudo apt-get install bpftrace
+
+# Rocky/RHEL/Fedora
+sudo dnf install bpftrace
+```
+
+If the script is not already running as root, only `bpftrace` is run through
+`sudo`; the wrapped command still runs as the original user. On a fresh host, the
+first measured command can take a few extra seconds while `bpftrace` compiles and
+attaches its probes.
 
 ## Installation
 
@@ -72,7 +84,10 @@ tests/linux-docker.sh
 ```
 
 The Docker test uses a privileged Linux container with the host PID namespace so
-`bpftrace` can observe the wrapped process and descendants.
+`bpftrace` can observe the wrapped process and descendants. The script handles
+the container setup, including installing `bpftrace` and mounting `tracefs`, but
+equivalent manual Docker runs need `--privileged`, `--pid=host`, and tracefs
+mounted at `/sys/kernel/tracing` when it is not already mounted.
 
 ## How It Works
 

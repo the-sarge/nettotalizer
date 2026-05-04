@@ -468,7 +468,7 @@ BEGIN
 }
 
 tracepoint:sched:sched_process_fork
-/args->parent_pid == $1 || @kids[args->parent_pid]/
+/args->parent_pid == (int32)$1 || @kids[args->parent_pid]/
 {
   @kids[args->child_pid] = 1;
 }
