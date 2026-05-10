@@ -58,9 +58,20 @@ set of descendants forked after tracing starts, so any child the wrapped
 command spawns is counted too. The wrapped command itself runs unprivileged;
 only `bpftrace` is invoked under `sudo`.
 
+**FreeBSD, NetBSD, and OpenBSD** do not expose one common unprivileged
+per-process network byte counter equivalent to Linux's `bpftrace` path or
+macOS's `nettop` process summaries. On those systems, `nettotalizer` takes a
+default-interface byte-counter snapshot with `netstat` immediately before and
+after the wrapped command, then reports the delta. This is useful as an
+estimate, but it includes any unrelated traffic on that interface during the
+same window, and `nettotalizer` prints a warning to make that explicit.
+
 ## Requirements
 
-`nettotalizer` is a Bash script for macOS and Linux. Nothing special needed there. It doesn't even need a newer Bash than the shamefully old version that Apple still includes with macOS.
+`nettotalizer` is a Bash script for macOS, Linux, FreeBSD, NetBSD, and OpenBSD.
+It doesn't need a newer Bash than the shamefully old version that Apple still
+includes with macOS. On the BSDs, install Bash first if it is not already
+available.
 
 On macOS, it uses the system `nettop` command and polls the wrapped process tree.
 
@@ -80,6 +91,9 @@ If the script is not already running as root, only `bpftrace` is run through
 `sudo`; the wrapped command still runs as the original user. On a fresh host, the
 first measured command can take a few extra seconds while `bpftrace` compiles and
 attaches its probes.
+
+On FreeBSD, NetBSD, and OpenBSD, it uses base-system `route` and `netstat`
+commands to read the default interface's byte counters.
 
 ## Installation
 
@@ -171,11 +185,20 @@ Run the macOS integration test on a Mac:
 tests/macos.sh
 ```
 
+The BSD backend is covered by the smoke tests with fake `route` and `netstat`
+output. To try it on a real BSD host, run a normal measured command and expect a
+warning that the result is an interface-delta estimate:
+
+```sh
+nettotalizer curl -sS -o /dev/null https://example.com
+```
+
 ## Limitations
 
-`nettotalizer` reports socket payload bytes, not complete interface bytes.
-Protocol headers, retransmits, and lower-level link overhead are not included
-in the process-scoped totals.
+On macOS and Linux, `nettotalizer` reports socket payload bytes, not complete
+interface bytes. Protocol headers, retransmits, and lower-level link overhead
+are not included in those process-scoped totals. The BSD backend is different:
+it reports default-interface byte deltas.
 
 On **macOS**, the backend is polling-based:
 
@@ -191,6 +214,12 @@ On **Linux**, the `bpftrace` backend depends on kernel probes. It does not
 cover raw sockets, `AF_PACKET`, or other nonstandard network paths. It also
 misses any I/O the wrapped command performs before `bpftrace` attaches —
 typically only a few hundred milliseconds, but not zero.
+
+On **FreeBSD, NetBSD, and OpenBSD**, results are interface-byte deltas rather
+than process-scoped socket totals. They can include unrelated host traffic
+during the wrapped command's runtime, and they can miss traffic that leaves
+through another interface because of VPNs, jails, routing tables, or split
+routing.
 
 Unsupported platforms run the wrapped command unmeasured after printing a
 warning.

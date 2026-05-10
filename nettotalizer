@@ -20,10 +20,13 @@
 #   the sampler.
 #   Linux uses bpftrace. It measures the wrapped PID and descendants forked
 #   after bpftrace attaches. Only bpftrace runs under sudo; the command does not.
+#   FreeBSD, NetBSD, and OpenBSD use a default-interface byte delta estimate.
 #
 # Limitations:
-#   These are socket payload bytes, not full interface bytes. Headers,
-#   retransmits, and lower-level link overhead are not counted.
+#   macOS and Linux report socket payload bytes, not full interface bytes.
+#   Headers, retransmits, and lower-level link overhead are not counted there.
+#   The BSD backend is different: it reports default-interface byte deltas, so
+#   unrelated host traffic can be included.
 #
 #   macOS has no simple, stable, unprivileged event stream for per-process socket
 #   byte accounting. The macOS backend therefore polls nettop against the visible
@@ -43,7 +46,7 @@ usage() {
   cat >&2 <<EOF
 Usage: $prog <command> [args...]
 
-Wrap a command and report socket-level network bytes transferred.
+Wrap a command and report network bytes transferred.
 
 Examples:
   $prog curl -sS -o /dev/null https://example.com/file.tar.gz
@@ -63,6 +66,9 @@ Notes:
 
   Linux uses bpftrace and may ask sudo for the tracer only; the wrapped
   command still runs as the original user.
+
+  FreeBSD, NetBSD, and OpenBSD use default-interface byte deltas. This is an
+  estimate that can include unrelated traffic from the same host.
 EOF
   exit 64
 }
@@ -177,10 +183,26 @@ descendant_pids() {
 }
 
 default_interface() {
-  # Used only for the macOS fallback estimate. route(8) tells us where ordinary
-  # internet traffic is likely to leave. VPNs and split routing can make this
-  # imperfect, but it is still a useful last-resort estimate for fast downloaders.
-  route -n get default 2>/dev/null | awk '/interface:/ { print $2; exit }'
+  # route(8) tells us where ordinary internet traffic is likely to leave. VPNs
+  # and split routing can make this imperfect, but it is still a useful estimate
+  # when process-scoped counters are unavailable or visibly incomplete.
+  local iface
+
+  iface=$(route -n get default 2>/dev/null | awk -F': *' '/interface:/ { print $2; exit }')
+  if [ -n "$iface" ]; then
+    printf '%s\n' "$iface"
+    return
+  fi
+
+  # Some route(8) variants are more useful for humans than scripts. Fall back to
+  # the routing table's interface column when the "route get" output did not
+  # expose one in the expected form.
+  netstat -rn -f inet 2>/dev/null | awk '
+    $1 == "default" || $1 == "0.0.0.0" {
+      print $NF
+      exit
+    }
+  '
 }
 
 interface_bytes() {
@@ -198,6 +220,31 @@ interface_bytes() {
     }
     END {
       if (!found) print "0 0"
+    }
+  '
+}
+
+bsd_interface_bytes() {
+  local iface=$1
+
+  # BSD netstat variants all support interface byte counters through the
+  # interface display with -b. Parse the Ibytes/Obytes headers instead of fixed
+  # columns because the surrounding packet/error columns vary by OS and version.
+  netstat -ibn -I "$iface" 2>/dev/null | awk -v iface="$iface" '
+    {
+      for (i = 1; i <= NF; i++) {
+        if ($i == "Ibytes") in_col = i
+        if ($i == "Obytes") out_col = i
+      }
+
+      if (in_col && out_col && $1 == iface) {
+        printf "%d %d\n", $in_col + 0, $out_col + 0
+        found = 1
+        exit
+      }
+    }
+    END {
+      if (!found) exit 1
     }
   '
 }
@@ -565,9 +612,53 @@ END
   exit "$exit_code"
 }
 
+run_bsd() {
+  if ! command -v route >/dev/null 2>&1 || ! command -v netstat >/dev/null 2>&1; then
+    echo "$prog: route/netstat not found; running unmeasured" >&2
+    exec "$@"
+  fi
+
+  local iface iface_before iface_after rx_before tx_before rx_after tx_after
+  local rx tx exit_code
+
+  iface=$(default_interface)
+  if [ -z "$iface" ]; then
+    echo "$prog: default route interface not found; running unmeasured" >&2
+    exec "$@"
+  fi
+
+  iface_before=$(bsd_interface_bytes "$iface")
+  if [ -z "$iface_before" ]; then
+    echo "$prog: could not read $iface byte counters; running unmeasured" >&2
+    exec "$@"
+  fi
+  read -r rx_before tx_before <<<"$iface_before"
+
+  "$@"
+  exit_code=$?
+
+  iface_after=$(bsd_interface_bytes "$iface")
+  if [ -z "$iface_after" ]; then
+    echo "$prog: could not read $iface byte counters after command" >&2
+    print_summary 0 0
+    exit "$exit_code"
+  fi
+  read -r rx_after tx_after <<<"$iface_after"
+
+  rx=$((rx_after - rx_before))
+  tx=$((tx_after - tx_before))
+  [ "$rx" -lt 0 ] && rx=0
+  [ "$tx" -lt 0 ] && tx=0
+
+  echo "$prog: BSD backend uses $iface interface delta estimate; includes unrelated traffic" >&2
+  print_summary "$rx" "$tx"
+  exit "$exit_code"
+}
+
 case "$(uname -s)" in
-  Darwin) run_macos "$@" ;;
-  Linux)  run_linux "$@" ;;
+  Darwin)                    run_macos "$@" ;;
+  Linux)                     run_linux "$@" ;;
+  FreeBSD|NetBSD|OpenBSD)    run_bsd "$@" ;;
   *)
     echo "$prog: unsupported platform $(uname -s); running unmeasured" >&2
     exec "$@"
