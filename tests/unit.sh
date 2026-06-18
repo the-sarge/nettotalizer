@@ -167,4 +167,25 @@ assert_eq use "$r" "fallback: interface delta more than doubles process rx -> us
 
 should_use_interface_fallback 100000 150000 && r=use || r=keep
 assert_eq keep "$r" "fallback: interface delta within margin -> keep process"
+
+# Isolate the 2x guard: delta beats process by >64KB but is not >2x -> keep.
+should_use_interface_fallback 200000 350000 && r=use || r=keep
+assert_eq keep "$r" "fallback: delta beats process by >64KB but not 2x -> keep process"
+
+# Strict boundaries: the absolute 64KB floor, the +64KB margin, and the 2x guard
+# all use -gt, so the threshold value itself must not trigger fallback.
+should_use_interface_fallback 0 65536 && r=use || r=keep
+assert_eq keep "$r" "fallback: exactly 64KB does not cross the floor"
+should_use_interface_fallback 0 65537 && r=use || r=keep
+assert_eq use "$r" "fallback: one byte over 64KB crosses the floor"
+
+should_use_interface_fallback 10000 75536 && r=use || r=keep
+assert_eq keep "$r" "fallback: exactly process+64KB does not cross the margin"
+should_use_interface_fallback 10000 75537 && r=use || r=keep
+assert_eq use "$r" "fallback: one byte over process+64KB crosses the margin"
+
+should_use_interface_fallback 100000 200000 && r=use || r=keep
+assert_eq keep "$r" "fallback: exactly 2x process rx does not cross the guard"
+should_use_interface_fallback 100000 200001 && r=use || r=keep
+assert_eq use "$r" "fallback: one byte over 2x process rx crosses the guard"
 ok "should_use_interface_fallback"

@@ -665,13 +665,7 @@ run_macos() {
   # If the process-scoped sampler reports little or no receive traffic while the
   # default interface advanced materially, prefer the interface delta. This is
   # what makes fast Homebrew downloads produce a useful number instead of 0B.
-  #
-  # Thresholds are intentionally blunt:
-  #   * require >64KB interface RX so ordinary background chatter does not flip
-  #     tiny commands into fallback mode;
-  #   * require the interface delta to beat process RX by >64KB; and
-  #   * if process RX is nonzero, require the interface delta to be >2x process
-  #     RX so we do not replace good process data for small differences.
+  # See should_use_interface_fallback() for the threshold rationale.
   #
   # When this triggers, print an explicit warning because the value is no longer
   # scoped only to the process tree and includes link-layer bytes.
