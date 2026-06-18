@@ -368,9 +368,14 @@ parse_interface_bytes() {
   # nonzero when it is absent. The Ibytes/Obytes columns are found by header name
   # but addressed from the right edge, so one rule spans the differing trailing
   # columns of the macOS and BSD netstat dialects and survives rows that omit a
-  # leading Address column (macOS VPN/utun interfaces). These counters include all
-  # traffic on the interface, not just the wrapped command, which is why callers
-  # emit an explicit warning.
+  # leading Address column (macOS VPN/utun interfaces). This relies on data rows
+  # preserving the header's trailing-column count, which both dialects honor.
+  #
+  # An interface can appear on several rows (a <Link#...> row plus per-address-
+  # family rows). Prefer the <Link#...> row to match the historical macOS
+  # selection, falling back to the first matching row for layouts without one.
+  # These counters include all traffic on the interface, not just the wrapped
+  # command, which is why callers emit an explicit warning.
   awk -v iface="$iface" '
     /Ibytes/ && /Obytes/ {
       for (i = 1; i <= NF; i++) {
@@ -382,13 +387,20 @@ parse_interface_bytes() {
     }
 
     have_header && $1 == iface {
-      printf "%d %d\n", $(NF - ib) + 0, $(NF - ob) + 0
-      found = 1
-      exit
+      rx = $(NF - ib) + 0
+      tx = $(NF - ob) + 0
+      if ($3 ~ /^<Link#/ && !have_link) {
+        link_rx = rx; link_tx = tx; have_link = 1
+      }
+      if (!have_any) {
+        any_rx = rx; any_tx = tx; have_any = 1
+      }
     }
 
     END {
-      if (!found) exit 1
+      if (have_link)     printf "%d %d\n", link_rx, link_tx
+      else if (have_any) printf "%d %d\n", any_rx, any_tx
+      else exit 1
     }
   '
 }

@@ -116,17 +116,28 @@ assert_eq "1000 2000" "$out" "interface bytes: macOS standard row"
 out=$(printf '%s\n' "$macos_std" | parse_interface_bytes lo0)
 assert_eq "5000 5000" "$out" "interface bytes: selects the named interface"
 
+# When an address-family row precedes the <Link#...> row with different counters,
+# the Link row must win (preserves the historical macOS selection).
+macos_reordered=$(printf '%s\n' \
+  'Name Mtu Network Address Ipkts Ierrs Ibytes Opkts Oerrs Obytes Coll' \
+  'en0 1500 192.168.1/24 192.168.1.5 10 0 9999 20 0 8888 0' \
+  'en0 1500 <Link#5> 00:11:22:33:44:55 10 0 1000 20 0 2000 0')
+out=$(printf '%s\n' "$macos_reordered" | parse_interface_bytes en0)
+assert_eq "1000 2000" "$out" "interface bytes: prefers the Link row over address-family rows"
+
 macos_utun=$(printf '%s\n' \
   'Name Mtu Network Address Ipkts Ierrs Ibytes Opkts Oerrs Obytes Coll' \
   'utun0 1380 <Link#23> 10 0 132072 20 0 6096 0')
 out=$(printf '%s\n' "$macos_utun" | parse_interface_bytes utun0)
 assert_eq "132072 6096" "$out" "interface bytes: addressless macOS VPN row"
 
+# Realistic BSD layout: packet/error/drop columns surround the byte columns, so
+# the right-edge offset has to skip the trailing Opkts/Oerrs/Obytes/Coll group.
 bsd=$(printf '%s\n' \
-  'Name Mtu Network Address Ibytes Obytes' \
-  'em0 1500 <Link#1> 00:11:22:33:44:55 4200 2600')
+  'Name Mtu Network Address Ipkts Ierrs Idrop Ibytes Opkts Oerrs Obytes Coll' \
+  'em0 1500 <Link#1> 00:11:22:33:44:55 100 0 0 4200 200 0 2600 0')
 out=$(printf '%s\n' "$bsd" | parse_interface_bytes em0)
-assert_eq "4200 2600" "$out" "interface bytes: BSD compact layout"
+assert_eq "4200 2600" "$out" "interface bytes: realistic BSD layout"
 
 out=$(printf '%s\n' "$bsd" | parse_interface_bytes wg0); rc=$?
 assert_eq "" "$out" "interface bytes: absent interface yields no output"
