@@ -1,0 +1,5 @@
+data_dir: ".ras/data"
+
+implement:
+  default_mode: pr
+  pr_remote: origin
