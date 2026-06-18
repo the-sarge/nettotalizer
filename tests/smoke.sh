@@ -57,6 +57,16 @@ exec /usr/bin/id "$@"
 EOF
 chmod +x "$tmpdir/bin/id" || fail "chmod fake id failed"
 
+cat >"$tmpdir/bin/mkfifo" <<'EOF'
+#!/usr/bin/env sh
+if [ "${NETTOTALIZER_FAKE_MKFIFO_FAIL:-0}" = 1 ]; then
+  exit 1
+fi
+
+PATH=/usr/bin:/bin:/usr/sbin:/sbin exec mkfifo "$@"
+EOF
+chmod +x "$tmpdir/bin/mkfifo" || fail "chmod fake mkfifo failed"
+
 NETTOTALIZER_FAKE_UNAME=TestOS PATH="$tmpdir/bin:$PATH" ./nettotalizer bash -c 'exit 42' \
   >"$tmpdir/exit.out" 2>"$tmpdir/exit.err"
 rc=$?
@@ -84,6 +94,14 @@ case "${NETTOTALIZER_FAKE_BPFTRACE_MODE:-ready}" in
     ;;
   fail-before-ready)
     exit 7
+    ;;
+  slow-ready)
+    printf '%s\n' "$$" >"${NETTOTALIZER_FAKE_TRACER_PID_FILE:?}"
+    trap 'exit 0' INT TERM
+    while :; do
+      sleep 0.1
+    done
+    printf 'NETTOTALIZER_READY\n'
     ;;
   *)
     printf 'unexpected fake bpftrace mode: %s\n' "$NETTOTALIZER_FAKE_BPFTRACE_MODE" >&2
@@ -125,6 +143,105 @@ if tail -n 3 "$tmpdir/linux-fail.err" | grep -Eq '^(total|received|sent) '; then
   fail "Linux failed tracer should not print a measured summary"
 fi
 ok "Linux tracer failure runs unmeasured"
+
+assert_pre_ready_signal_cleanup() {
+  local signal=$1
+  local expected_status=$2
+  local tracer_pid_file wrapper_pid children rc pid
+
+  tracer_pid_file="$tmpdir/slow-tracer-$signal.pid"
+  rm -f "$tracer_pid_file"
+
+  NETTOTALIZER_FAKE_UNAME=Linux \
+    NETTOTALIZER_FAKE_BPFTRACE_MODE=slow-ready \
+    NETTOTALIZER_FAKE_TRACER_PID_FILE="$tracer_pid_file" \
+    PATH="$tmpdir/bin:$PATH" \
+    ./nettotalizer sh -c 'sleep 30' \
+    >"$tmpdir/linux-$signal.out" 2>"$tmpdir/linux-$signal.err" &
+  wrapper_pid=$!
+
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    [ -s "$tracer_pid_file" ] && break
+    sleep 0.1
+  done
+  [ -s "$tracer_pid_file" ] || fail "slow tracer did not start for $signal"
+
+  children=
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    children=$(pgrep -P "$wrapper_pid" 2>/dev/null || true)
+    [ "$(printf '%s\n' "$children" | sed '/^$/d' | wc -l | tr -d ' ')" -ge 2 ] && break
+    sleep 0.1
+  done
+
+  kill "-$signal" "$wrapper_pid" 2>/dev/null || true
+  wait "$wrapper_pid"
+  rc=$?
+  assert_eq "$expected_status" "$rc" "pre-ready $signal exit code"
+
+  for pid in $children "$(cat "$tracer_pid_file")"; do
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -TERM "$pid" 2>/dev/null || true
+      fail "pre-ready $signal leaked process $pid"
+    fi
+  done
+  ok "Linux pre-ready $signal cleans up tracer and gated command"
+}
+
+assert_pre_ready_signal_cleanup TERM 143
+
+cat >"$tmpdir/bin/nettop" <<'EOF'
+#!/usr/bin/env sh
+case "${NETTOTALIZER_FAKE_NETTOP_MODE:-ready}" in
+  fail)
+    exit 5
+    ;;
+  ready)
+    printf ',bytes_in,bytes_out,\n'
+    printf 'bash.%s,0,0,\n' "$$"
+    ;;
+  *)
+    printf 'unexpected fake nettop mode: %s\n' "$NETTOTALIZER_FAKE_NETTOP_MODE" >&2
+    exit 2
+    ;;
+esac
+EOF
+chmod +x "$tmpdir/bin/nettop" || fail "chmod fake nettop failed"
+
+NETTOTALIZER_FAKE_UNAME=Darwin \
+  NETTOTALIZER_FAKE_NETTOP_MODE=fail \
+  PATH="$tmpdir/bin:$PATH" \
+  ./nettotalizer sh -c 'printf "%s\n" macos-unmeasured; exit 37' \
+  >"$tmpdir/macos-fail.out" 2>"$tmpdir/macos-fail.err"
+rc=$?
+assert_eq 37 "$rc" "macOS failed sampler preserves exit code"
+assert_eq macos-unmeasured "$(cat "$tmpdir/macos-fail.out")" "macOS failed sampler stdout"
+grep -q 'macOS sampler exited before command start; running unmeasured' "$tmpdir/macos-fail.err" ||
+  fail "macOS failed sampler warning missing"
+if tail -n 3 "$tmpdir/macos-fail.err" | grep -Eq '^(total|received|sent) '; then
+  fail "macOS failed sampler should not print a measured summary"
+fi
+ok "macOS sampler failure runs unmeasured"
+
+leak_tmpdir="$tmpdir/leak-tmp"
+mkdir -p "$leak_tmpdir" || fail "mkdir leak tmpdir failed"
+NETTOTALIZER_FAKE_UNAME=Darwin \
+  NETTOTALIZER_FAKE_MKFIFO_FAIL=1 \
+  TMPDIR="$leak_tmpdir" \
+  PATH="$tmpdir/bin:$PATH" \
+  ./nettotalizer sh -c 'printf "%s\n" fifo-fallback; exit 33' \
+  >"$tmpdir/fifo-fallback.out" 2>"$tmpdir/fifo-fallback.err"
+rc=$?
+assert_eq 33 "$rc" "mkfifo fallback preserves exit code"
+assert_eq fifo-fallback "$(cat "$tmpdir/fifo-fallback.out")" "mkfifo fallback stdout"
+grep -q 'mkfifo failed; running unmeasured' "$tmpdir/fifo-fallback.err" ||
+  fail "mkfifo fallback warning missing"
+if tail -n 3 "$tmpdir/fifo-fallback.err" | grep -Eq '^(total|received|sent) '; then
+  fail "mkfifo fallback should not print a measured summary"
+fi
+if find "$leak_tmpdir" -name 'nettotalizer.*' -print -quit | grep -q .; then
+  fail "mkfifo fallback leaked nettotalizer temp files"
+fi
+ok "lifecycle init fallback cleans up temp files"
 
 cat >"$tmpdir/bin/route" <<'EOF'
 #!/usr/bin/env sh
