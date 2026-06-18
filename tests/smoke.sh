@@ -147,16 +147,24 @@ ok "Linux tracer failure runs unmeasured"
 assert_pre_ready_signal_cleanup() {
   local signal=$1
   local expected_status=$2
-  local tracer_pid_file wrapper_pid children rc pid
+  local tracer_pid_file wrapper_pid children rc pid timeout_file watchdog_pid
 
   tracer_pid_file="$tmpdir/slow-tracer-$signal.pid"
+  timeout_file="$tmpdir/slow-wrapper-$signal.timeout"
   rm -f "$tracer_pid_file"
+  rm -f "$timeout_file"
 
+  command -v perl >/dev/null 2>&1 ||
+    fail "perl not found for signal-disposition smoke helper"
+
+  # Bash starts background jobs with SIGINT ignored. Reset it before execing the
+  # wrapper so this probe exercises nettotalizer's INT trap.
   NETTOTALIZER_FAKE_UNAME=Linux \
     NETTOTALIZER_FAKE_BPFTRACE_MODE=slow-ready \
     NETTOTALIZER_FAKE_TRACER_PID_FILE="$tracer_pid_file" \
     PATH="$tmpdir/bin:$PATH" \
-    ./nettotalizer sh -c 'sleep 30' \
+    perl -e '$SIG{INT} = "DEFAULT"; $SIG{TERM} = "DEFAULT"; exec @ARGV; die "exec failed: $!\n"' \
+      ./nettotalizer sh -c 'sleep 30' \
     >"$tmpdir/linux-$signal.out" 2>"$tmpdir/linux-$signal.err" &
   wrapper_pid=$!
 
@@ -174,8 +182,21 @@ assert_pre_ready_signal_cleanup() {
   done
 
   kill "-$signal" "$wrapper_pid" 2>/dev/null || true
+  (
+    sleep 5
+    if kill -0 "$wrapper_pid" 2>/dev/null; then
+      : >"$timeout_file"
+      kill -TERM "$wrapper_pid" 2>/dev/null || true
+      sleep 0.5
+      kill -KILL "$wrapper_pid" 2>/dev/null || true
+    fi
+  ) &
+  watchdog_pid=$!
   wait "$wrapper_pid"
   rc=$?
+  kill "$watchdog_pid" 2>/dev/null || true
+  wait "$watchdog_pid" 2>/dev/null || true
+  [ ! -e "$timeout_file" ] || fail "pre-ready $signal wrapper did not exit"
   assert_eq "$expected_status" "$rc" "pre-ready $signal exit code"
 
   for pid in $children "$(cat "$tracer_pid_file")"; do
@@ -187,6 +208,7 @@ assert_pre_ready_signal_cleanup() {
   ok "Linux pre-ready $signal cleans up tracer and gated command"
 }
 
+assert_pre_ready_signal_cleanup INT 130
 assert_pre_ready_signal_cleanup TERM 143
 
 cat >"$tmpdir/bin/nettop" <<'EOF'

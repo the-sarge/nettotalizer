@@ -181,6 +181,20 @@ reap_measured_command_adapter_jobs() {
   done
 }
 
+stop_measured_command_before_release() {
+  local signal=$1
+
+  [ -n "${cmd_pid:-}" ] || return 0
+
+  kill "-$signal" "$cmd_pid" 2>/dev/null || true
+  # The gated bash runner can ignore SIGINT before it has exec'd the command.
+  # This path runs only before release, so force the shim down and reap it.
+  kill -TERM "$cmd_pid" 2>/dev/null || true
+  sleep 0.05
+  kill -KILL "$cmd_pid" 2>/dev/null || true
+  wait "$cmd_pid" 2>/dev/null || true
+}
+
 abort_measured_command_before_release() {
   local signal=$1
   local status=$2
@@ -192,10 +206,7 @@ abort_measured_command_before_release() {
   [ -n "${measured_command_adapter_stop:-}" ] &&
     "$measured_command_adapter_stop" 2>/dev/null
 
-  if [ -n "${cmd_pid:-}" ]; then
-    kill "-$signal" "$cmd_pid" 2>/dev/null || true
-    wait "$cmd_pid" 2>/dev/null || true
-  fi
+  stop_measured_command_before_release "$signal"
 
   reap_measured_command_adapter_jobs
   measured_command_cleanup
