@@ -163,6 +163,10 @@ run_command_unmeasured() {
   measured_command_measurement_started=0
 }
 
+measured_command_noop() {
+  :
+}
+
 terminate_measured_command_adapter_jobs() {
   local child
 
@@ -235,11 +239,12 @@ release_measured_command() {
 run_measured_command_lifecycle() {
   local adapter_start=$1
   local adapter_await_ready=$2
-  local adapter_stop=$3
-  local adapter_failed_message=$4
-  local adapter_timeout_message=$5
+  local adapter_before_release=$3
+  local adapter_stop=$4
+  local adapter_failed_message=$5
+  local adapter_timeout_message=$6
   local ready_status exit_code
-  shift 5
+  shift 6
 
   measured_command_exit_code=0
   measured_command_measurement_started=0
@@ -293,6 +298,7 @@ run_measured_command_lifecycle() {
     echo "$prog: $adapter_timeout_message" >&2
   fi
 
+  "$adapter_before_release"
   release_measured_command
   trap forward_int INT
   trap forward_term TERM
@@ -387,15 +393,6 @@ bsd_interface_bytes() {
 }
 
 macos_measurement_start() {
-  # Capture the interface baseline after the gated shim exists but before the
-  # real command is released. This keeps the fallback interval aligned as closely
-  # as possible with the command's actual runtime.
-  iface=$(default_interface)
-  if [ -n "$iface" ]; then
-    iface_before=$(interface_bytes "$iface")
-    read -r iface_rx_before iface_tx_before <<<"$iface_before"
-  fi
-
   # Use repeated one-shot CSV samples. In infinite logging mode (-L 0), nettop
   # can leave redirected output empty when it is killed after the command exits.
   (
@@ -428,6 +425,26 @@ macos_measurement_start() {
     done
   ) &
   sampler_pid=$!
+}
+
+macos_measurement_before_release() {
+  # Capture the fallback baseline after the sampler is ready, immediately before
+  # the real command is released. This excludes unrelated traffic that happened
+  # while the command was still gated.
+  iface=
+  iface_before=
+  iface_rx_before=0
+  iface_tx_before=0
+
+  iface=$(default_interface)
+  if [ -n "$iface" ]; then
+    iface_before=$(interface_bytes "$iface")
+    if [ -n "$iface_before" ]; then
+      read -r iface_rx_before iface_tx_before <<<"$iface_before"
+    else
+      iface=
+    fi
+  fi
 }
 
 macos_measurement_await_ready() {
@@ -495,6 +512,7 @@ run_macos() {
   run_measured_command_lifecycle \
     macos_measurement_start \
     macos_measurement_await_ready \
+    macos_measurement_before_release \
     macos_measurement_stop \
     "macOS sampler exited before command start" \
     "macOS sampler did not become ready before command start; measurement may undercount" \
@@ -736,6 +754,7 @@ END
   run_measured_command_lifecycle \
     linux_measurement_start \
     linux_measurement_await_ready \
+    measured_command_noop \
     linux_measurement_stop \
     "bpftrace exited before command start" \
     "bpftrace did not become ready before command start; measurement may undercount" \

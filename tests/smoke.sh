@@ -221,6 +221,11 @@ case "${NETTOTALIZER_FAKE_NETTOP_MODE:-ready}" in
     printf ',bytes_in,bytes_out,\n'
     printf 'bash.%s,0,0,\n' "$$"
     ;;
+  ready-after-pre-release-traffic)
+    : >"${NETTOTALIZER_FAKE_PRE_READY_TRAFFIC_FILE:?}"
+    printf ',bytes_in,bytes_out,\n'
+    printf 'bash.%s,0,0,\n' "$$"
+    ;;
   *)
     printf 'unexpected fake nettop mode: %s\n' "$NETTOTALIZER_FAKE_NETTOP_MODE" >&2
     exit 2
@@ -277,6 +282,48 @@ case "$*" in
 esac
 EOF
 chmod +x "$tmpdir/bin/route" || fail "chmod fake route failed"
+
+cat >"$tmpdir/bin/netstat" <<'EOF'
+#!/usr/bin/env sh
+if [ -e "${NETTOTALIZER_FAKE_PRE_READY_TRAFFIC_FILE:?}" ]; then
+  rx=201000
+  tx=302000
+else
+  rx=1000
+  tx=2000
+fi
+
+cat <<NETSTAT
+Name Mtu Network Address Ipkts Ierrs Ibytes Opkts Oerrs Obytes Coll
+em0 1500 <Link#1> 00:11:22:33:44:55 10 0 $rx 20 0 $tx 0
+NETSTAT
+EOF
+chmod +x "$tmpdir/bin/netstat" || fail "chmod fake macOS netstat failed"
+
+pre_ready_traffic_file="$tmpdir/macos-pre-ready-traffic"
+rm -f "$pre_ready_traffic_file"
+NETTOTALIZER_FAKE_UNAME=Darwin \
+  NETTOTALIZER_FAKE_NETTOP_MODE=ready-after-pre-release-traffic \
+  NETTOTALIZER_FAKE_PRE_READY_TRAFFIC_FILE="$pre_ready_traffic_file" \
+  PATH="$tmpdir/bin:$PATH" \
+  ./nettotalizer sh -c 'printf "%s\n" macos-no-network' \
+  >"$tmpdir/macos-pre-ready.out" 2>"$tmpdir/macos-pre-ready.err"
+rc=$?
+assert_eq 0 "$rc" "macOS pre-ready interface traffic exit code"
+assert_eq macos-no-network "$(cat "$tmpdir/macos-pre-ready.out")" \
+  "macOS pre-ready interface traffic stdout"
+[ -e "$pre_ready_traffic_file" ] ||
+  fail "macOS fake sampler did not simulate pre-release interface traffic"
+if grep -q 'process samples undercounted received bytes' "$tmpdir/macos-pre-ready.err"; then
+  fail "macOS fallback included pre-release interface traffic"
+fi
+tail -n 3 "$tmpdir/macos-pre-ready.err" | grep -q '^total 0B$' ||
+  fail "macOS pre-ready interface traffic total summary mismatch"
+tail -n 3 "$tmpdir/macos-pre-ready.err" | grep -q '^received 0B$' ||
+  fail "macOS pre-ready interface traffic received summary mismatch"
+tail -n 3 "$tmpdir/macos-pre-ready.err" | grep -q '^sent 0B$' ||
+  fail "macOS pre-ready interface traffic sent summary mismatch"
+ok "macOS fallback ignores pre-release interface traffic"
 
 cat >"$tmpdir/bin/netstat" <<EOF
 #!/usr/bin/env sh
