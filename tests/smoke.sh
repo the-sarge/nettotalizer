@@ -49,7 +49,7 @@ chmod +x "$tmpdir/bin/uname" || fail "chmod fake uname failed"
 cat >"$tmpdir/bin/id" <<'EOF'
 #!/usr/bin/env sh
 if [ "${1:-}" = "-u" ]; then
-  printf '0\n'
+  printf '%s\n' "${NETTOTALIZER_FAKE_ID_U:-0}"
   exit 0
 fi
 
@@ -111,6 +111,16 @@ esac
 EOF
 chmod +x "$tmpdir/bin/bpftrace" || fail "chmod fake bpftrace failed"
 
+cat >"$tmpdir/bin/sudo" <<'EOF'
+#!/usr/bin/env sh
+if [ "${1:-}" = "-v" ]; then
+  exit "${NETTOTALIZER_FAKE_SUDO_VALIDATE_STATUS:-0}"
+fi
+
+exec "$@"
+EOF
+chmod +x "$tmpdir/bin/sudo" || fail "chmod fake sudo failed"
+
 ready_file="$tmpdir/bpftrace-ready"
 NETTOTALIZER_FAKE_UNAME=Linux \
   NETTOTALIZER_FAKE_BPFTRACE_MODE=ready \
@@ -161,6 +171,27 @@ if grep -q 'Bad file descriptor' "$tmpdir/linux-closed-stdin.err"; then
   fail "Linux measured closed stdin emitted fd diagnostics"
 fi
 ok "Linux measured command tolerates closed stdin"
+
+sudo_leak_tmpdir="$tmpdir/sudo-leak-tmp"
+mkdir -p "$sudo_leak_tmpdir" || fail "mkdir sudo leak tmpdir failed"
+NETTOTALIZER_FAKE_UNAME=Linux \
+  NETTOTALIZER_FAKE_ID_U=501 \
+  NETTOTALIZER_FAKE_SUDO_VALIDATE_STATUS=1 \
+  TMPDIR="$sudo_leak_tmpdir" \
+  PATH="$tmpdir/bin:$PATH" \
+  ./nettotalizer sh -c 'printf "%s" sudo-fallback; exit 17' \
+  >"$tmpdir/linux-sudo-fallback.out" 2>"$tmpdir/linux-sudo-fallback.err"
+rc=$?
+assert_eq 17 "$rc" "Linux sudo fallback exit code"
+assert_eq sudo-fallback "$(cat "$tmpdir/linux-sudo-fallback.out")" \
+  "Linux sudo fallback stdout"
+grep -q 'sudo authentication failed; running unmeasured' \
+  "$tmpdir/linux-sudo-fallback.err" ||
+  fail "Linux sudo fallback warning missing"
+if find "$sudo_leak_tmpdir" -name 'nettotalizer.*' -print -quit | grep -q .; then
+  fail "Linux sudo fallback leaked bpftrace temp files"
+fi
+ok "Linux sudo fallback cleans up tracer temp file"
 
 NETTOTALIZER_FAKE_UNAME=Linux \
   NETTOTALIZER_FAKE_BPFTRACE_MODE=fail-before-ready \
