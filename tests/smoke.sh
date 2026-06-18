@@ -129,6 +129,23 @@ tail -n 3 "$tmpdir/linux-ready.err" | grep -q '^sent 512B$' ||
   fail "Linux ready-gated sent summary mismatch"
 ok "Linux command waits for tracer readiness"
 
+stdin_ready_file="$tmpdir/bpftrace-stdin-ready"
+printf 'abc\n' | NETTOTALIZER_FAKE_UNAME=Linux \
+  NETTOTALIZER_FAKE_BPFTRACE_MODE=ready \
+  NETTOTALIZER_FAKE_READY_FILE="$stdin_ready_file" \
+  PATH="$tmpdir/bin:$PATH" \
+  ./nettotalizer cat >"$tmpdir/linux-stdin.out" 2>"$tmpdir/linux-stdin.err"
+rc=$?
+assert_eq 0 "$rc" "Linux measured stdin exit code"
+assert_eq abc "$(cat "$tmpdir/linux-stdin.out")" "Linux measured stdin"
+tail -n 3 "$tmpdir/linux-stdin.err" | grep -q '^total 2.5KB$' ||
+  fail "Linux measured stdin total summary mismatch"
+tail -n 3 "$tmpdir/linux-stdin.err" | grep -q '^received 2.0KB$' ||
+  fail "Linux measured stdin received summary mismatch"
+tail -n 3 "$tmpdir/linux-stdin.err" | grep -q '^sent 512B$' ||
+  fail "Linux measured stdin sent summary mismatch"
+ok "Linux measured command preserves piped stdin"
+
 NETTOTALIZER_FAKE_UNAME=Linux \
   NETTOTALIZER_FAKE_BPFTRACE_MODE=fail-before-ready \
   PATH="$tmpdir/bin:$PATH" \

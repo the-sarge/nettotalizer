@@ -121,13 +121,10 @@ run_command_background_gated() {
   # bash shim that blocks on a private FIFO. The wrapper starts measurement,
   # writes one byte to the FIFO, and then the shim `exec`s the real command in
   # the same PID.
-  if [ -t 0 ] && [ -r /dev/tty ]; then
-    bash -c 'gate=$1; shift; IFS= read -r _ < "$gate"; exec "$@"' \
-      "$prog-runner" "$gate" "$@" </dev/tty &
-  else
-    bash -c 'gate=$1; shift; IFS= read -r _ < "$gate"; exec "$@"' \
-      "$prog-runner" "$gate" "$@" &
-  fi
+  # Async bash jobs get /dev/null for stdin unless it is redirected explicitly.
+  # Save fd 0 before reading the gate, then restore it for the measured command.
+  bash -c 'gate=$1; shift; exec 9<&0; IFS= read -r _ < "$gate"; exec 0<&9 9<&-; exec "$@"' \
+    "$prog-runner" "$gate" "$@" <&0 &
 
   cmd_pid=$!
 }
