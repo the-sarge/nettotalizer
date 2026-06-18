@@ -587,6 +587,21 @@ parse_nettop_samples() {
   '
 }
 
+should_use_interface_fallback() {
+  # Decide whether the interface delta should replace the process-scoped count.
+  # Thresholds are intentionally blunt:
+  #   * require >64KB interface RX so ordinary background chatter does not flip
+  #     tiny commands into fallback mode;
+  #   * require the interface delta to beat process RX by >64KB; and
+  #   * if process RX is nonzero, require the interface delta to be >2x process
+  #     RX so good process data is not replaced for small differences.
+  local process_rx=$1 delta_rx=$2
+
+  [ "$delta_rx" -gt 65536 ] &&
+    [ "$delta_rx" -gt $((process_rx + 65536)) ] &&
+    { [ "$process_rx" -eq 0 ] || [ "$delta_rx" -gt $((process_rx * 2)) ]; }
+}
+
 run_macos() {
   if ! command -v nettop >/dev/null 2>&1; then
     echo "$prog: nettop not found; running unmeasured" >&2
@@ -668,9 +683,7 @@ run_macos() {
     iface_rx_delta=$(clamped_delta "${iface_rx_before:-0}" "$iface_rx_after")
     iface_tx_delta=$(clamped_delta "${iface_tx_before:-0}" "$iface_tx_after")
 
-    if [ "$iface_rx_delta" -gt 65536 ] &&
-      [ "$iface_rx_delta" -gt $((${rx:-0} + 65536)) ] &&
-      { [ "${rx:-0}" -eq 0 ] || [ "$iface_rx_delta" -gt $((${rx:-0} * 2)) ]; }; then
+    if should_use_interface_fallback "${rx:-0}" "$iface_rx_delta"; then
       rx=$iface_rx_delta
       tx=$iface_tx_delta
       fallback_used=1

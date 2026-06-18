@@ -151,3 +151,20 @@ assert_eq 500 "$(clamped_delta 1000 1500)" "clamped delta: normal increase"
 assert_eq 0 "$(clamped_delta 1500 1000)" "clamped delta: decrease floored to zero"
 assert_eq 0 "$(clamped_delta 4200 4200)" "clamped delta: no change is zero"
 ok "clamped_delta"
+
+# ---------------------------------------------------------------------------
+# should_use_interface_fallback: prefer the interface delta only when process
+# samples clearly undercounted received bytes.
+# ---------------------------------------------------------------------------
+should_use_interface_fallback 0 70000 && r=use || r=keep
+assert_eq use "$r" "fallback: zero process rx, large interface delta -> use"
+
+should_use_interface_fallback 0 1000 && r=use || r=keep
+assert_eq keep "$r" "fallback: small interface delta -> keep process"
+
+should_use_interface_fallback 100000 250000 && r=use || r=keep
+assert_eq use "$r" "fallback: interface delta more than doubles process rx -> use"
+
+should_use_interface_fallback 100000 150000 && r=use || r=keep
+assert_eq keep "$r" "fallback: interface delta within margin -> keep process"
+ok "should_use_interface_fallback"
