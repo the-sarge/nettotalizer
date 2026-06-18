@@ -68,3 +68,33 @@ Landed PR #4, the first of four behavior-preserving refactors making `nettotaliz
 - PR 2: extract `parse_nettop_samples` / `parse_bpftrace_totals`.
 - PR 3: unify the interface reader (`parse_interface_bytes`) + `clamped_delta`.
 - PR 4: extract `should_use_interface_fallback`.
+
+---
+
+## Testable measurement modules — PR 2 (sampler parsers) landed - 2026-06-18 19:23 EDT
+
+**Main:** `d5a69d05e2c3`
+**Actor:** Claude Opus 4.8 (1M context)
+
+**Summary**
+
+Landed PR #7, the second refactor: the two sampler-output reducers now live in named pure functions that read stdin, so they are unit-testable with canned text instead of fake `nettop`/`bpftrace` processes.
+
+**Completed**
+
+- `parse_nettop_samples` — nettop CSV snapshots → `"samples rx tx"` (header discovery, PID-keyed dedupe across the exec rename, cumulative max).
+- `parse_bpftrace_totals` — bpftrace END output → `"rx tx"` (last value wins, missing → 0).
+- `run_macos`/`run_linux` call the parsers instead of embedding awk.
+- Unit coverage: distinct-PID sum, exec-rename dedupe, header-only zero-sample, zero-byte sampled row (`1 0 0`), and header-order independence.
+
+**Decisions**
+
+- RAS `review-fix` found no blocking issues. Two non-blocking test-coverage gaps (zero-byte sampled row, swapped `bytes_out`/`bytes_in` header) were fixed inline rather than deferred — they complete this PR's own deliverable and are cheap/in-area, which the review-loop policy endorses.
+
+**Validation**
+
+- `bash -n nettotalizer`, `bash tests/unit.sh`, `bash tests/smoke.sh` — green on `main` after squash-merge (`d5a69d0`).
+
+**Next**
+
+- PR 3: unify the interface reader (`parse_interface_bytes`, header-from-right) + `clamped_delta`.
