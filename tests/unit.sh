@@ -65,3 +65,39 @@ assert_eq "1.5KB"   "$(format_bytes 1536)"       "format_bytes: fractional KB"
 assert_eq "1.0MB"   "$(format_bytes 1048576)"    "format_bytes: MB boundary"
 assert_eq "1.00GB"  "$(format_bytes 1073741824)" "format_bytes: GB boundary"
 ok "format_bytes"
+
+# ---------------------------------------------------------------------------
+# parse_bpftrace_totals: bpftrace END output -> "rx tx"
+# ---------------------------------------------------------------------------
+out=$(printf 'NETTOTALIZER_READY\nNETTOTALIZER_RX 2048\nNETTOTALIZER_TX 512\n' | parse_bpftrace_totals)
+assert_eq "2048 512" "$out" "bpftrace totals: basic rx/tx"
+
+out=$(printf 'NETTOTALIZER_RX 10\nNETTOTALIZER_RX 2048\nNETTOTALIZER_TX 1\nNETTOTALIZER_TX 512\n' | parse_bpftrace_totals)
+assert_eq "2048 512" "$out" "bpftrace totals: last value wins"
+
+out=$(printf 'NETTOTALIZER_READY\n' | parse_bpftrace_totals)
+assert_eq "0 0" "$out" "bpftrace totals: missing values are zero"
+ok "parse_bpftrace_totals"
+
+# ---------------------------------------------------------------------------
+# parse_nettop_samples: accumulated nettop CSV snapshots -> "samples rx tx"
+# ---------------------------------------------------------------------------
+out=$(printf '%s\n' ',bytes_in,bytes_out,' 'bash.123,100,200,' 'curl.456,300,400,' | parse_nettop_samples)
+assert_eq "2 400 600" "$out" "nettop samples: sums distinct PIDs"
+
+out=$(printf '%s\n' ',bytes_in,bytes_out,' 'bash.123,100,200,' ',bytes_in,bytes_out,' 'curl.123,150,250,' | parse_nettop_samples)
+assert_eq "2 150 250" "$out" "nettop samples: dedupes exec rename, keeps max"
+
+out=$(printf '%s\n' ',bytes_in,bytes_out,' | parse_nettop_samples)
+assert_eq "0 0 0" "$out" "nettop samples: header-only reports zero samples"
+
+# A zero-byte data row is still a sample: samples=1 must differ from samples=0,
+# because run_macos warns only when nothing was sampled at all.
+out=$(printf '%s\n' ',bytes_in,bytes_out,' 'bash.123,0,0,' | parse_nettop_samples)
+assert_eq "1 0 0" "$out" "nettop samples: zero-byte row still counts as sampled"
+
+# Columns are discovered by header name, not position: a swapped header still maps
+# rx/tx correctly.
+out=$(printf '%s\n' ',bytes_out,bytes_in,' 'curl.456,400,300,' | parse_nettop_samples)
+assert_eq "1 300 400" "$out" "nettop samples: maps columns by header, not position"
+ok "parse_nettop_samples"
