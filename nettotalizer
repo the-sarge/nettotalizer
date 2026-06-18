@@ -240,11 +240,12 @@ run_measured_command_lifecycle() {
   local adapter_start=$1
   local adapter_await_ready=$2
   local adapter_before_release=$3
-  local adapter_stop=$4
-  local adapter_failed_message=$5
-  local adapter_timeout_message=$6
+  local adapter_after_release=$4
+  local adapter_stop=$5
+  local adapter_failed_message=$6
+  local adapter_timeout_message=$7
   local ready_status exit_code
-  shift 6
+  shift 7
 
   measured_command_exit_code=0
   measured_command_measurement_started=0
@@ -300,6 +301,7 @@ run_measured_command_lifecycle() {
 
   "$adapter_before_release"
   release_measured_command
+  "$adapter_after_release"
   trap forward_int INT
   trap forward_term TERM
 
@@ -396,8 +398,7 @@ macos_measurement_start() {
   # Use repeated one-shot CSV samples. In infinite logging mode (-L 0), nettop
   # can leave redirected output empty when it is killed after the command exits.
   (
-    local pids pid
-    local nettop_args nettop_pid nettop_status
+    local nettop_pid
 
     macos_sampler_cleanup() {
       [ -n "${nettop_pid:-}" ] || return 0
@@ -409,10 +410,10 @@ macos_measurement_start() {
       nettop_pid=
     }
 
-    trap 'macos_sampler_cleanup; exit 0' HUP INT TERM
+    macos_run_nettop_sample() {
+      local output=$1
+      local pids pid nettop_args nettop_status
 
-    rm -f "$sampler_status" 2>/dev/null || true
-    while kill -0 "$cmd_pid" 2>/dev/null; do
       # Rebuild the PID list every poll because package managers and git-like
       # tools often launch short-lived helpers. nettop accepts repeated -p flags,
       # which is the only way to ask for multiple process summaries.
@@ -423,18 +424,32 @@ macos_measurement_start() {
         nettop_args+=(-p "$pid")
       done
 
-      nettop "${nettop_args[@]}" >>"$nt_out" 2>/dev/null &
+      nettop "${nettop_args[@]}" >>"$output" 2>/dev/null &
       nettop_pid=$!
       wait "$nettop_pid"
       nettop_status=$?
       nettop_pid=
 
-      if [ "$nettop_status" -eq 0 ]; then
-        [ -e "$sampler_status" ] || printf 'ready\n' >"$sampler_status"
-      elif [ ! -e "$sampler_status" ]; then
-        printf 'failed\n' >"$sampler_status"
-        break
-      fi
+      return "$nettop_status"
+    }
+
+    trap 'macos_sampler_cleanup; exit 0' HUP INT TERM
+
+    rm -f "$sampler_status" 2>/dev/null || true
+    rm -f "$sampler_released" 2>/dev/null || true
+    if macos_run_nettop_sample /dev/null; then
+      printf 'ready\n' >"$sampler_status"
+    else
+      printf 'failed\n' >"$sampler_status"
+      exit 0
+    fi
+
+    while kill -0 "$cmd_pid" 2>/dev/null && [ ! -e "$sampler_released" ]; do
+      sleep 0.01
+    done
+
+    while kill -0 "$cmd_pid" 2>/dev/null; do
+      macos_run_nettop_sample "$nt_out" || true
 
       # nettop -L 1 returns a current snapshot immediately. Poll quickly so
       # short-lived downloader children, such as Homebrew's fetch helpers, are
@@ -463,6 +478,10 @@ macos_measurement_before_release() {
       iface=
     fi
   fi
+}
+
+macos_measurement_after_release() {
+  : >"$sampler_released" || true
 }
 
 macos_measurement_await_ready() {
@@ -496,7 +515,7 @@ run_macos() {
     exec "$@"
   fi
 
-  local nt_out sampler_status sampler_pid cmd_pid exit_code samples rx_tx rx tx
+  local nt_out sampler_status sampler_released sampler_pid cmd_pid exit_code samples rx_tx rx tx
   local iface iface_before iface_after iface_rx_before iface_tx_before
   local iface_rx_after iface_tx_after iface_rx_delta iface_tx_delta fallback_used
   local measured_command_gate measured_command_exit_code
@@ -524,13 +543,15 @@ run_macos() {
     exec "$@"
   }
   sampler_status=$nt_out.status
+  sampler_released=$nt_out.released
 
-  trap 'rm -f "$nt_out" "$sampler_status" 2>/dev/null; measured_command_cleanup' EXIT
+  trap 'rm -f "$nt_out" "$sampler_status" "$sampler_released" 2>/dev/null; measured_command_cleanup' EXIT
 
   run_measured_command_lifecycle \
     macos_measurement_start \
     macos_measurement_await_ready \
     macos_measurement_before_release \
+    macos_measurement_after_release \
     macos_measurement_stop \
     "macOS sampler exited before command start" \
     "macOS sampler did not become ready before command start; measurement may undercount" \
@@ -772,6 +793,7 @@ END
   run_measured_command_lifecycle \
     linux_measurement_start \
     linux_measurement_await_ready \
+    measured_command_noop \
     measured_command_noop \
     linux_measurement_stop \
     "bpftrace exited before command start" \

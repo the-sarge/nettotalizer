@@ -221,6 +221,16 @@ case "${NETTOTALIZER_FAKE_NETTOP_MODE:-ready}" in
     printf ',bytes_in,bytes_out,\n'
     printf 'bash.%s,0,0,\n' "$$"
     ;;
+  pre-release-row-then-empty)
+    count_file=${NETTOTALIZER_FAKE_NETTOP_COUNT_FILE:?}
+    count=$(cat "$count_file" 2>/dev/null || printf '0')
+    count=$((count + 1))
+    printf '%s\n' "$count" >"$count_file"
+    printf ',bytes_in,bytes_out,\n'
+    if [ "$count" -eq 1 ]; then
+      printf 'bash.%s,0,0,\n' "$$"
+    fi
+    ;;
   ready-after-pre-release-traffic)
     : >"${NETTOTALIZER_FAKE_PRE_READY_TRAFFIC_FILE:?}"
     printf ',bytes_in,bytes_out,\n'
@@ -366,6 +376,34 @@ em0 1500 <Link#1> 00:11:22:33:44:55 10 0 $rx 20 0 $tx 0
 NETSTAT
 EOF
 chmod +x "$tmpdir/bin/netstat" || fail "chmod fake macOS netstat failed"
+
+pre_release_sample_count="$tmpdir/macos-pre-release-sample-count"
+no_pre_ready_traffic_file="$tmpdir/macos-no-pre-ready-traffic"
+rm -f "$pre_release_sample_count"
+rm -f "$no_pre_ready_traffic_file"
+NETTOTALIZER_FAKE_UNAME=Darwin \
+  NETTOTALIZER_FAKE_NETTOP_MODE=pre-release-row-then-empty \
+  NETTOTALIZER_FAKE_NETTOP_COUNT_FILE="$pre_release_sample_count" \
+  NETTOTALIZER_FAKE_PRE_READY_TRAFFIC_FILE="$no_pre_ready_traffic_file" \
+  PATH="$tmpdir/bin:$PATH" \
+  ./nettotalizer sh -c 'printf "%s\n" macos-fast-no-sample' \
+  >"$tmpdir/macos-fast-no-sample.out" 2>"$tmpdir/macos-fast-no-sample.err"
+rc=$?
+assert_eq 0 "$rc" "macOS fast no-sample exit code"
+assert_eq macos-fast-no-sample "$(cat "$tmpdir/macos-fast-no-sample.out")" \
+  "macOS fast no-sample stdout"
+[ -s "$pre_release_sample_count" ] ||
+  fail "macOS fake sampler did not emit pre-release row"
+grep -q 'no samples captured (process tree finished between nettop polls)' \
+  "$tmpdir/macos-fast-no-sample.err" ||
+  fail "macOS fast no-sample warning missing"
+tail -n 3 "$tmpdir/macos-fast-no-sample.err" | grep -q '^total 0B$' ||
+  fail "macOS fast no-sample total summary mismatch"
+tail -n 3 "$tmpdir/macos-fast-no-sample.err" | grep -q '^received 0B$' ||
+  fail "macOS fast no-sample received summary mismatch"
+tail -n 3 "$tmpdir/macos-fast-no-sample.err" | grep -q '^sent 0B$' ||
+  fail "macOS fast no-sample sent summary mismatch"
+ok "macOS pre-release samples do not suppress no-sample warning"
 
 pre_ready_traffic_file="$tmpdir/macos-pre-ready-traffic"
 rm -f "$pre_ready_traffic_file"
