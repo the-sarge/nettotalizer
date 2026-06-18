@@ -111,20 +111,6 @@ tmpfile() {
   mktemp "${TMPDIR:-/tmp}/${prog}.XXXXXX"
 }
 
-run_command_background() {
-  # Used by the Linux path. We need a PID before starting the tracer, so the
-  # wrapped command runs in the background. Keeping stdin attached to /dev/tty
-  # preserves simple stdin consumers, but this is still not a real PTY/job-control
-  # wrapper; full-screen or interactive programs remain out of scope.
-  if [ -t 0 ] && [ -r /dev/tty ]; then
-    "$@" </dev/tty &
-  else
-    "$@" &
-  fi
-
-  cmd_pid=$!
-}
-
 run_command_background_gated() {
   local gate=$1
   shift
@@ -135,13 +121,29 @@ run_command_background_gated() {
   # bash shim that blocks on a private FIFO. The wrapper starts measurement,
   # writes one byte to the FIFO, and then the shim `exec`s the real command in
   # the same PID.
-  if [ -t 0 ] && [ -r /dev/tty ]; then
-    bash -c 'gate=$1; shift; IFS= read -r _ < "$gate"; exec "$@"' \
-      "$prog-runner" "$gate" "$@" </dev/tty &
-  else
-    bash -c 'gate=$1; shift; IFS= read -r _ < "$gate"; exec "$@"' \
-      "$prog-runner" "$gate" "$@" &
-  fi
+  # Async bash jobs get /dev/null for stdin unless it is redirected explicitly.
+  # Save fd 0 before reading the gate, then restore it for the measured command.
+  # If the caller closed stdin, keep it closed and suppress duplicate-fd noise.
+  bash -c '
+    gate=$1
+    shift
+
+    stdin_open=0
+    if { exec 9<&0; } 2>/dev/null; then
+      stdin_open=1
+    fi
+
+    IFS= read -r _ < "$gate"
+
+    if [ "$stdin_open" -eq 1 ]; then
+      exec 0<&9 9<&-
+    else
+      exec 0<&-
+    fi
+
+    exec "$@"
+  ' \
+    "$prog-runner" "$gate" "$@" <&0 &
 
   cmd_pid=$!
 }
@@ -165,6 +167,165 @@ forward_int() {
 
 forward_term() {
   [ -n "${cmd_pid:-}" ] && kill -TERM "$cmd_pid" 2>/dev/null
+}
+
+measured_command_cleanup() {
+  [ -n "${measured_command_gate:-}" ] && rm -f "$measured_command_gate" 2>/dev/null
+}
+
+run_command_unmeasured() {
+  "$@"
+  measured_command_exit_code=$?
+  measured_command_measurement_started=0
+}
+
+measured_command_noop() {
+  :
+}
+
+terminate_measured_command_adapter_jobs() {
+  local child
+
+  for child in $(jobs -p 2>/dev/null || true); do
+    [ -n "${cmd_pid:-}" ] && [ "$child" = "$cmd_pid" ] && continue
+    kill -TERM "$child" 2>/dev/null || true
+  done
+}
+
+reap_measured_command_adapter_jobs() {
+  local child
+
+  for child in $(jobs -p 2>/dev/null || true); do
+    [ -n "${cmd_pid:-}" ] && [ "$child" = "$cmd_pid" ] && continue
+    wait "$child" 2>/dev/null || true
+  done
+}
+
+stop_measured_command_before_release() {
+  local signal=$1
+
+  [ -n "${cmd_pid:-}" ] || return 0
+
+  kill "-$signal" "$cmd_pid" 2>/dev/null || true
+  # The gated bash runner can ignore SIGINT before it has exec'd the command.
+  # This path runs only before release, so force the shim down and reap it.
+  kill -TERM "$cmd_pid" 2>/dev/null || true
+  sleep 0.05
+  kill -KILL "$cmd_pid" 2>/dev/null || true
+  wait "$cmd_pid" 2>/dev/null || true
+}
+
+abort_measured_command_before_release() {
+  local signal=$1
+  local status=$2
+
+  trap - INT
+  trap - TERM
+
+  terminate_measured_command_adapter_jobs
+  [ -n "${measured_command_adapter_stop:-}" ] &&
+    "$measured_command_adapter_stop" 2>/dev/null
+
+  stop_measured_command_before_release "$signal"
+
+  reap_measured_command_adapter_jobs
+  measured_command_cleanup
+  exit "$status"
+}
+
+abort_measured_command_int() {
+  abort_measured_command_before_release INT 130
+}
+
+abort_measured_command_term() {
+  abort_measured_command_before_release TERM 143
+}
+
+release_measured_command() {
+  if [ -n "${measured_command_gate:-}" ] &&
+    [ -p "$measured_command_gate" ] &&
+    [ -n "${cmd_pid:-}" ] &&
+    kill -0 "$cmd_pid" 2>/dev/null; then
+    printf '\n' >"$measured_command_gate"
+  fi
+
+  measured_command_cleanup
+}
+
+run_measured_command_lifecycle() {
+  local adapter_start=$1
+  local adapter_await_ready=$2
+  local adapter_before_release=$3
+  local adapter_after_release=$4
+  local adapter_stop=$5
+  local adapter_failed_message=$6
+  local adapter_timeout_message=$7
+  local ready_status exit_code
+  shift 7
+
+  measured_command_exit_code=0
+  measured_command_measurement_started=0
+  measured_command_adapter_stop=$adapter_stop
+  measured_command_gate=$(tmpfile) || {
+    echo "$prog: mktemp failed; running unmeasured" >&2
+    run_command_unmeasured "$@"
+    return
+  }
+
+  rm -f "$measured_command_gate"
+  if ! mkfifo "$measured_command_gate"; then
+    echo "$prog: mkfifo failed; running unmeasured" >&2
+    measured_command_cleanup
+    run_command_unmeasured "$@"
+    return
+  fi
+
+  run_command_background_gated "$measured_command_gate" "$@"
+  trap abort_measured_command_int INT
+  trap abort_measured_command_term TERM
+
+  if ! "$adapter_start"; then
+    echo "$prog: $adapter_failed_message; running unmeasured" >&2
+    "$adapter_stop"
+    release_measured_command
+    trap forward_int INT
+    trap forward_term TERM
+    wait_for_command
+    measured_command_exit_code=$?
+    return
+  fi
+
+  measured_command_measurement_started=1
+  "$adapter_await_ready"
+  ready_status=$?
+
+  if [ "$ready_status" -eq 2 ]; then
+    echo "$prog: $adapter_failed_message; running unmeasured" >&2
+    measured_command_measurement_started=0
+    "$adapter_stop"
+    release_measured_command
+    trap forward_int INT
+    trap forward_term TERM
+    wait_for_command
+    measured_command_exit_code=$?
+    return
+  fi
+
+  if [ "$ready_status" -ne 0 ]; then
+    echo "$prog: $adapter_timeout_message" >&2
+  fi
+
+  "$adapter_before_release"
+  release_measured_command
+  "$adapter_after_release"
+  trap forward_int INT
+  trap forward_term TERM
+
+  wait_for_command
+  exit_code=$?
+
+  "$adapter_stop"
+  measured_command_exit_code=$exit_code
 }
 
 descendant_pids() {
@@ -214,7 +375,7 @@ interface_bytes() {
   # wrapped command, which is why the fallback emits an explicit warning.
   netstat -ibn | awk -v iface="$iface" '
     $1 == iface && $3 ~ /^<Link#/ {
-      print $7 + 0, $10 + 0
+      print $(NF - 4) + 0, $(NF - 1) + 0
       found = 1
       exit
     }
@@ -249,21 +410,138 @@ bsd_interface_bytes() {
   '
 }
 
+macos_measurement_start() {
+  # Use repeated one-shot CSV samples. In infinite logging mode (-L 0), nettop
+  # can leave redirected output empty when it is killed after the command exits.
+  (
+    local nettop_pid
+
+    macos_sampler_cleanup() {
+      [ -n "${nettop_pid:-}" ] || return 0
+
+      kill -TERM "$nettop_pid" 2>/dev/null || true
+      sleep 0.05
+      kill -KILL "$nettop_pid" 2>/dev/null || true
+      wait "$nettop_pid" 2>/dev/null || true
+      nettop_pid=
+    }
+
+    macos_run_nettop_sample() {
+      local output=$1
+      local pids pid nettop_args nettop_status
+
+      # Rebuild the PID list every poll because package managers and git-like
+      # tools often launch short-lived helpers. nettop accepts repeated -p flags,
+      # which is the only way to ask for multiple process summaries.
+      pids=$(descendant_pids "$cmd_pid")
+
+      nettop_args=(-n -P -x -L 1 -s 1 -J bytes_in,bytes_out)
+      for pid in $pids; do
+        nettop_args+=(-p "$pid")
+      done
+
+      nettop "${nettop_args[@]}" >>"$output" 2>/dev/null &
+      nettop_pid=$!
+      wait "$nettop_pid"
+      nettop_status=$?
+      nettop_pid=
+
+      return "$nettop_status"
+    }
+
+    trap 'macos_sampler_cleanup; exit 0' HUP INT TERM
+
+    rm -f "$sampler_status" 2>/dev/null || true
+    rm -f "$sampler_released" 2>/dev/null || true
+    if macos_run_nettop_sample /dev/null; then
+      printf 'ready\n' >"$sampler_status"
+    else
+      printf 'failed\n' >"$sampler_status"
+      exit 0
+    fi
+
+    while kill -0 "$cmd_pid" 2>/dev/null && [ ! -e "$sampler_released" ]; do
+      sleep 0.01
+    done
+
+    while kill -0 "$cmd_pid" 2>/dev/null; do
+      macos_run_nettop_sample "$nt_out" || true
+
+      # nettop -L 1 returns a current snapshot immediately. Poll quickly so
+      # short-lived downloader children, such as Homebrew's fetch helpers, are
+      # less likely to appear and disappear between samples.
+      kill -0 "$cmd_pid" 2>/dev/null && sleep 0.1
+    done
+  ) &
+  sampler_pid=$!
+}
+
+macos_measurement_before_release() {
+  # Capture the fallback baseline after the sampler is ready, immediately before
+  # the real command is released. This excludes unrelated traffic that happened
+  # while the command was still gated.
+  iface=
+  iface_before=
+  iface_rx_before=0
+  iface_tx_before=0
+
+  iface=$(default_interface)
+  if [ -n "$iface" ]; then
+    iface_before=$(interface_bytes "$iface")
+    if [ -n "$iface_before" ]; then
+      read -r iface_rx_before iface_tx_before <<<"$iface_before"
+    else
+      iface=
+    fi
+  fi
+}
+
+macos_measurement_after_release() {
+  : >"$sampler_released" || true
+}
+
+macos_measurement_await_ready() {
+  local i status max_polls
+  max_polls=${NETTOTALIZER_TEST_READY_POLLS:-600}
+
+  for ((i = 0; i < max_polls; i++)); do
+    if [ -s "$sampler_status" ]; then
+      status=$(cat "$sampler_status")
+      [ "$status" = ready ] && return 0
+      return 2
+    fi
+
+    kill -0 "$sampler_pid" 2>/dev/null || return 2
+    sleep 0.05
+  done
+
+  return 1
+}
+
+macos_measurement_stop() {
+  [ -n "${sampler_pid:-}" ] || return 0
+  kill -TERM "$sampler_pid" 2>/dev/null || true
+  wait "$sampler_pid" 2>/dev/null || true
+}
+
 run_macos() {
   if ! command -v nettop >/dev/null 2>&1; then
     echo "$prog: nettop not found; running unmeasured" >&2
     exec "$@"
   fi
 
-  local nt_out command_gate sampler_pid cmd_pid exit_code samples rx_tx rx tx
+  local nt_out sampler_status sampler_released sampler_pid cmd_pid exit_code samples rx_tx rx tx
   local iface iface_before iface_after iface_rx_before iface_tx_before
   local iface_rx_after iface_tx_after iface_rx_delta iface_tx_delta fallback_used
+  local measured_command_gate measured_command_exit_code
+  local measured_command_measurement_started measured_command_adapter_stop
 
   # macOS strategy, in plain English:
   #
   #   1. Create a temp CSV file for nettop snapshots.
-  #   2. Create a FIFO gate and launch a bash shim that waits on it.
-  #   3. Start the sampler against the shim PID, then release the gate.
+  #   2. Let the measured command lifecycle launch a gated bash shim.
+  #   3. Start the sampler against the shim PID, then let the lifecycle release
+  #      the gate.
   #   4. The shim execs the real command, preserving that PID as the root.
   #   5. Every poll, discover currently-live descendants and ask nettop for a
   #      one-shot CSV snapshot for every PID we know about.
@@ -279,82 +557,25 @@ run_macos() {
     echo "$prog: mktemp failed; running unmeasured" >&2
     exec "$@"
   }
+  sampler_status=$nt_out.status
+  sampler_released=$nt_out.released
 
-  # mktemp creates a regular file, then mkfifo needs the path to not exist. Keep
-  # the two-step flow instead of hand-rolling random names.
-  command_gate=$(tmpfile) || {
-    echo "$prog: mktemp failed; running unmeasured" >&2
-    exec "$@"
-  }
-  rm -f "$command_gate"
-  if ! mkfifo "$command_gate"; then
-    echo "$prog: mkfifo failed; running unmeasured" >&2
-    rm -f "$nt_out" 2>/dev/null
-    exec "$@"
+  trap 'rm -f "$nt_out" "$sampler_status" "$sampler_released" 2>/dev/null; measured_command_cleanup' EXIT
+
+  run_measured_command_lifecycle \
+    macos_measurement_start \
+    macos_measurement_await_ready \
+    macos_measurement_before_release \
+    macos_measurement_after_release \
+    macos_measurement_stop \
+    "macOS sampler exited before command start" \
+    "macOS sampler did not become ready before command start; measurement may undercount" \
+    "$@"
+  exit_code=$measured_command_exit_code
+
+  if [ "$measured_command_measurement_started" -ne 1 ]; then
+    exit "$exit_code"
   fi
-
-  trap 'rm -f "$nt_out" "$command_gate" 2>/dev/null' EXIT
-
-  run_command_background_gated "$command_gate" "$@"
-
-  # Capture the interface baseline after the gated shim exists but before the
-  # real command is released. This keeps the fallback interval aligned as closely
-  # as possible with the command's actual runtime.
-  iface=$(default_interface)
-  if [ -n "$iface" ]; then
-    iface_before=$(interface_bytes "$iface")
-    read -r iface_rx_before iface_tx_before <<<"$iface_before"
-  fi
-
-  # Use repeated one-shot CSV samples. In infinite logging mode (-L 0), nettop
-  # can leave redirected output empty when it is killed after the command exits.
-  #
-  # nettop flags:
-  #   -P       per-process summary, not per-socket rows
-  #   -x       raw integer byte counters
-  #   -n       avoid DNS/service lookups while sampling
-  #   -L 1     CSV logging mode, one immediate flushed snapshot per invocation
-  #   -s 1     portable integer interval accepted by macOS nettop
-  #   -p PID   track one process; repeat for descendants discovered below
-  #   -J ...   output only the columns we parse
-  (
-    local pids pid
-    local nettop_args
-
-    while kill -0 "$cmd_pid" 2>/dev/null; do
-      # Rebuild the PID list every poll because package managers and git-like
-      # tools often launch short-lived helpers. nettop accepts repeated -p flags,
-      # which is the only way to ask for multiple process summaries.
-      pids=$(descendant_pids "$cmd_pid")
-
-      nettop_args=(-n -P -x -L 1 -s 1 -J bytes_in,bytes_out)
-      for pid in $pids; do
-        nettop_args+=(-p "$pid")
-      done
-
-      nettop "${nettop_args[@]}" >>"$nt_out" 2>/dev/null || true
-
-      # nettop -L 1 returns a current snapshot immediately. Poll quickly so
-      # short-lived downloader children, such as Homebrew's fetch helpers, are
-      # less likely to appear and disappear between samples.
-      kill -0 "$cmd_pid" 2>/dev/null && sleep 0.1
-    done
-  ) &
-  sampler_pid=$!
-
-  # Release the command after the sampler process exists. The sampler may still
-  # miss extremely short-lived children, but this removes the larger race where
-  # the wrapped command starts before monitoring starts at all.
-  printf '\n' >"$command_gate"
-  rm -f "$command_gate" 2>/dev/null
-
-  trap forward_int INT
-  trap forward_term TERM
-
-  wait_for_command
-  exit_code=$?
-
-  wait "$sampler_pid" 2>/dev/null || true
 
   # Parse the accumulated CSV snapshots.
   #
@@ -451,6 +672,36 @@ run_macos() {
   exit "$exit_code"
 }
 
+linux_measurement_start() {
+  # -p ties bpftrace to the command lifetime on versions that support auto-exit.
+  # We still send SIGINT after wait so END reliably prints totals.
+  $sudo_cmd bpftrace -q -e "$bt_script" -p "$cmd_pid" "$cmd_pid" >"$bt_out" &
+  bt_pid=$!
+}
+
+linux_measurement_await_ready() {
+  local i
+
+  # Older bpftrace builds can take several seconds to compile and attach the
+  # first time they run on a fresh host. Wait long enough to keep fast commands
+  # gated until the tracer has really started.
+  for ((i = 0; i < 600; i++)); do
+    if grep -q '^NETTOTALIZER_READY$' "$bt_out" 2>/dev/null; then
+      return 0
+    fi
+
+    kill -0 "$bt_pid" 2>/dev/null || return 2
+    sleep 0.05
+  done
+
+  return 1
+}
+
+linux_measurement_stop() {
+  [ -n "${bt_pid:-}" ] || return 0
+  kill -INT "$bt_pid" 2>/dev/null || true
+  wait "$bt_pid" 2>/dev/null || true
+}
 
 run_linux() {
   if ! command -v bpftrace >/dev/null 2>&1; then
@@ -458,8 +709,9 @@ run_linux() {
     exec "$@"
   fi
 
-  local bt_out command_gate bt_pid cmd_pid exit_code rx tx sudo_cmd
-  local ready i
+  local bt_out bt_pid cmd_pid exit_code rx tx sudo_cmd
+  local measured_command_gate measured_command_exit_code
+  local measured_command_measurement_started measured_command_adapter_stop
 
   # Linux strategy:
   #
@@ -478,24 +730,11 @@ run_linux() {
     exec "$@"
   }
 
-  command_gate=$(tmpfile) || {
-    echo "$prog: mktemp failed; running unmeasured" >&2
-    rm -f "$bt_out" 2>/dev/null
-    exec "$@"
-  }
-  rm -f "$command_gate"
-  if ! mkfifo "$command_gate"; then
-    echo "$prog: mkfifo failed; running unmeasured" >&2
-    rm -f "$bt_out" 2>/dev/null
-    exec "$@"
-  fi
-
-  trap 'rm -f "$bt_out" "$command_gate" 2>/dev/null' EXIT
-
   sudo_cmd=
   if [ "$(id -u)" -ne 0 ]; then
     if ! command -v sudo >/dev/null 2>&1; then
       echo "$prog: bpftrace requires root and sudo is unavailable; running unmeasured" >&2
+      rm -f "$bt_out" 2>/dev/null
       exec "$@"
     fi
 
@@ -503,13 +742,12 @@ run_linux() {
     # time spent at a sudo prompt and keeps the wrapped command unprivileged.
     if ! sudo -v; then
       echo "$prog: sudo authentication failed; running unmeasured" >&2
+      rm -f "$bt_out" 2>/dev/null
       exec "$@"
     fi
 
     sudo_cmd=sudo
   fi
-
-  run_command_background_gated "$command_gate" "$@"
 
   # The bpftrace script uses positional argument $1 for the root PID. @kids is
   # populated from sched_process_fork so grandchildren are included after their
@@ -567,40 +805,22 @@ END
 }
 '
 
-  # -p ties bpftrace to the command lifetime on versions that support auto-exit.
-  # We still send SIGINT after wait so END reliably prints totals.
-  $sudo_cmd bpftrace -q -e "$bt_script" -p "$cmd_pid" "$cmd_pid" >"$bt_out" &
-  bt_pid=$!
+  trap 'rm -f "$bt_out" 2>/dev/null; measured_command_cleanup' EXIT
 
-  ready=0
-  # Older bpftrace builds can take several seconds to compile and attach the
-  # first time they run on a fresh host. Wait long enough to keep fast commands
-  # gated until the tracer has really started.
-  for ((i = 0; i < 600; i++)); do
-    if grep -q '^NETTOTALIZER_READY$' "$bt_out" 2>/dev/null; then
-      ready=1
-      break
-    fi
+  run_measured_command_lifecycle \
+    linux_measurement_start \
+    linux_measurement_await_ready \
+    measured_command_noop \
+    measured_command_noop \
+    linux_measurement_stop \
+    "bpftrace exited before command start" \
+    "bpftrace did not become ready before command start; measurement may undercount" \
+    "$@"
+  exit_code=$measured_command_exit_code
 
-    kill -0 "$bt_pid" 2>/dev/null || break
-    sleep 0.05
-  done
-
-  if [ "$ready" -ne 1 ]; then
-    echo "$prog: bpftrace did not become ready before command start; measurement may undercount" >&2
+  if [ "$measured_command_measurement_started" -ne 1 ]; then
+    exit "$exit_code"
   fi
-
-  printf '\n' >"$command_gate"
-  rm -f "$command_gate" 2>/dev/null
-
-  trap forward_int INT
-  trap forward_term TERM
-
-  wait_for_command
-  exit_code=$?
-
-  kill -INT "$bt_pid" 2>/dev/null || true
-  wait "$bt_pid" 2>/dev/null || true
 
   # Use the last printed values in case bpftrace emits multiple lines around
   # shutdown. Missing values intentionally collapse to 0 so measurement failure
