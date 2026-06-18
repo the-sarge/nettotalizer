@@ -38,9 +38,8 @@
 #   socket payload bytes.
 # =============================================================================
 
-set -u
-
-prog=${0##*/}
+prog=${BASH_SOURCE[0]:-$0}
+prog=${prog##*/}
 
 usage() {
   cat >&2 <<EOF
@@ -875,6 +874,8 @@ run_bsd() {
 # script can be sourced (for unit tests) without selecting a backend or running a
 # command; only direct execution crosses the main guard below.
 main() {
+  set -u
+
   case "${1:-}" in
     ""|-h|--help) usage ;;
   esac
@@ -892,6 +893,7 @@ main() {
 
 # Run dispatch only when executed directly. When this file is sourced, the guard
 # is false, so the functions above are defined without any of them running.
-if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+# `bash -s` leaves BASH_SOURCE[0] empty, which is also direct execution.
+if [[ -z "${BASH_SOURCE[0]:-}" || "${BASH_SOURCE[0]:-}" == "$0" ]]; then
   main "$@"
 fi

@@ -20,6 +20,13 @@ assert_eq() {
   fi
 }
 
+assert_contains() {
+  local needle=$1 haystack=$2 label=$3
+  if ! printf '%s\n' "$haystack" | grep -Fq -- "$needle"; then
+    fail "$label: expected output to contain '$needle', got '$haystack'"
+  fi
+}
+
 # Keystone: the script is sourceable without running dispatch.
 src_out=$( ( source "$repo_root/nettotalizer" ) 2>&1 )
 src_rc=$?
@@ -31,6 +38,24 @@ ok "script is sourceable without running"
 
 # Load the modules under test for everything below.
 source "$repo_root/nettotalizer"
+assert_eq "nettotalizer" "$prog" "sourcing sets prog from nettotalizer path"
+ok "sourced prog name"
+
+nounset_state=$(bash -c 'set +u; source "$1"; set -o | awk "/^nounset[[:space:]]/ { print \$2 }"' _ "$repo_root/nettotalizer")
+assert_eq "off" "$nounset_state" "sourcing nettotalizer preserves caller nounset state"
+ok "sourcing preserves nounset state"
+
+direct_help_out=$("$repo_root/nettotalizer" --help 2>&1)
+direct_help_rc=$?
+assert_eq 64 "$direct_help_rc" "direct --help exits with usage status"
+assert_contains "Usage: nettotalizer <command> [args...]" "$direct_help_out" "direct --help prints nettotalizer usage"
+ok "direct help"
+
+stdin_help_out=$(cat "$repo_root/nettotalizer" | bash -s -- --help 2>&1)
+stdin_help_rc=$?
+assert_eq 64 "$stdin_help_rc" "stdin --help exits with usage status"
+assert_contains "Usage:" "$stdin_help_out" "stdin --help prints usage"
+ok "stdin help"
 
 # format_bytes is already pure; characterize it now that it is reachable.
 assert_eq "0B"      "$(format_bytes 0)"          "format_bytes: zero"
