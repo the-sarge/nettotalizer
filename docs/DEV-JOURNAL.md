@@ -129,3 +129,34 @@ Landed PR #8, the third refactor: the two divergent `netstat` interface-byte par
 **Next**
 
 - PR 4 (final): extract `should_use_interface_fallback`.
+
+---
+
+## Testable measurement modules — PR 4 (fallback decision) landed; effort complete - 2026-06-18 19:48 EDT
+
+**Main:** `4cec3698dc1e`
+**Actor:** Claude Opus 4.8 (1M context)
+
+**Summary**
+
+Landed PR #10, the final refactor: the macOS "trust the interface delta" policy is now `should_use_interface_fallback`, a pure predicate over two numbers. This completes the four-PR effort — `run_macos`/`run_linux` are now thin orchestration over tested pure modules.
+
+**Completed**
+
+- `should_use_interface_fallback <process_rx> <delta_rx>` — the three-threshold decision as a side-effect-free predicate; `run_macos` calls it instead of inlining the condition.
+- Unit truth table including a 2x-isolating case and strict `-gt` boundary cases (64KB floor, `process+64KB` margin, `2x` guard) that kill `-gt`→`-ge` mutants.
+- De-duplicated the threshold rationale — it now lives only in the predicate; `run_macos` points to it.
+
+**Decisions**
+
+- RAS `review-fix` found no blocking issues. Three non-blocking findings (2x-isolating test, strict-boundary tests, duplicated comment) were fixed inline — they complete the predicate's own coverage/quality.
+- Transient GitHub mergeability lag after the fix push required a short poll before squash-merge; no conflict.
+
+**Validation**
+
+- `bash -n nettotalizer`, `bash tests/unit.sh`, `bash tests/smoke.sh` — green on `main` after squash-merge (`4cec369`).
+
+**Outcome**
+
+- Four behavior-preserving PRs (#4, #7, #8, #10) landed: main guard + five extracted modules (`parse_nettop_samples`, `parse_bpftrace_totals`, `parse_interface_bytes`, `clamped_delta`, `should_use_interface_fallback`), one duplicate parser deleted, `tests/unit.sh` added.
+- Open follow-ups: #5, #6 (PR 1 test infra), #9 (PR 3 wrapper not-found tests).
