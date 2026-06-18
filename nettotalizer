@@ -38,9 +38,8 @@
 #   socket payload bytes.
 # =============================================================================
 
-set -u
-
-prog=${0##*/}
+prog=${BASH_SOURCE[0]:-$0}
+prog=${prog##*/}
 
 usage() {
   cat >&2 <<EOF
@@ -72,10 +71,6 @@ Notes:
 EOF
   exit 64
 }
-
-case "${1:-}" in
-  ""|-h|--help) usage ;;
-esac
 
 # Render integer byte counts compactly. Bash has no portable floating point, so
 # awk handles the fractional KB/MB/GB cases.
@@ -875,12 +870,30 @@ run_bsd() {
   exit "$exit_code"
 }
 
-case "$(uname -s)" in
-  Darwin)                    run_macos "$@" ;;
-  Linux)                     run_linux "$@" ;;
-  FreeBSD|NetBSD|OpenBSD)    run_bsd "$@" ;;
-  *)
-    echo "$prog: unsupported platform $(uname -s); running unmeasured" >&2
-    exec "$@"
-    ;;
-esac
+# Parse arguments and dispatch to the platform backend. Kept in a function so the
+# script can be sourced (for unit tests) without selecting a backend or running a
+# command; only direct execution crosses the main guard below.
+main() {
+  set -u
+
+  case "${1:-}" in
+    ""|-h|--help) usage ;;
+  esac
+
+  case "$(uname -s)" in
+    Darwin)                    run_macos "$@" ;;
+    Linux)                     run_linux "$@" ;;
+    FreeBSD|NetBSD|OpenBSD)    run_bsd "$@" ;;
+    *)
+      echo "$prog: unsupported platform $(uname -s); running unmeasured" >&2
+      exec "$@"
+      ;;
+  esac
+}
+
+# Run dispatch only when executed directly. When this file is sourced, the guard
+# is false, so the functions above are defined without any of them running.
+# `bash -s` leaves BASH_SOURCE[0] empty, which is also direct execution.
+if [[ -z "${BASH_SOURCE[0]:-}" || "${BASH_SOURCE[0]:-}" == "$0" ]]; then
+  main "$@"
+fi
