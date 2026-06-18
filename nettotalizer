@@ -397,7 +397,19 @@ macos_measurement_start() {
   # can leave redirected output empty when it is killed after the command exits.
   (
     local pids pid
-    local nettop_args
+    local nettop_args nettop_pid nettop_status
+
+    macos_sampler_cleanup() {
+      [ -n "${nettop_pid:-}" ] || return 0
+
+      kill -TERM "$nettop_pid" 2>/dev/null || true
+      sleep 0.05
+      kill -KILL "$nettop_pid" 2>/dev/null || true
+      wait "$nettop_pid" 2>/dev/null || true
+      nettop_pid=
+    }
+
+    trap 'macos_sampler_cleanup; exit 0' HUP INT TERM
 
     rm -f "$sampler_status" 2>/dev/null || true
     while kill -0 "$cmd_pid" 2>/dev/null; do
@@ -411,7 +423,13 @@ macos_measurement_start() {
         nettop_args+=(-p "$pid")
       done
 
-      if nettop "${nettop_args[@]}" >>"$nt_out" 2>/dev/null; then
+      nettop "${nettop_args[@]}" >>"$nt_out" 2>/dev/null &
+      nettop_pid=$!
+      wait "$nettop_pid"
+      nettop_status=$?
+      nettop_pid=
+
+      if [ "$nettop_status" -eq 0 ]; then
         [ -e "$sampler_status" ] || printf 'ready\n' >"$sampler_status"
       elif [ ! -e "$sampler_status" ]; then
         printf 'failed\n' >"$sampler_status"

@@ -226,6 +226,13 @@ case "${NETTOTALIZER_FAKE_NETTOP_MODE:-ready}" in
     printf ',bytes_in,bytes_out,\n'
     printf 'bash.%s,0,0,\n' "$$"
     ;;
+  slow-ready)
+    printf '%s\n' "$$" >"${NETTOTALIZER_FAKE_NETTOP_PID_FILE:?}"
+    trap 'exit 0' HUP INT TERM
+    while :; do
+      sleep 0.1
+    done
+    ;;
   *)
     printf 'unexpected fake nettop mode: %s\n' "$NETTOTALIZER_FAKE_NETTOP_MODE" >&2
     exit 2
@@ -233,6 +240,66 @@ case "${NETTOTALIZER_FAKE_NETTOP_MODE:-ready}" in
 esac
 EOF
 chmod +x "$tmpdir/bin/nettop" || fail "chmod fake nettop failed"
+
+assert_macos_pre_ready_signal_cleanup() {
+  local signal=$1
+  local expected_status=$2
+  local nettop_pid_file wrapper_pid rc timeout_file watchdog_pid pid
+
+  nettop_pid_file="$tmpdir/slow-nettop-$signal.pid"
+  timeout_file="$tmpdir/slow-macos-wrapper-$signal.timeout"
+  rm -f "$nettop_pid_file"
+  rm -f "$timeout_file"
+
+  command -v perl >/dev/null 2>&1 ||
+    fail "perl not found for signal-disposition smoke helper"
+
+  # Bash starts background jobs with SIGINT ignored. Reset it before execing the
+  # wrapper so this probe exercises nettotalizer's INT trap.
+  NETTOTALIZER_FAKE_UNAME=Darwin \
+    NETTOTALIZER_FAKE_NETTOP_MODE=slow-ready \
+    NETTOTALIZER_FAKE_NETTOP_PID_FILE="$nettop_pid_file" \
+    PATH="$tmpdir/bin:$PATH" \
+    perl -e '$SIG{INT} = "DEFAULT"; $SIG{TERM} = "DEFAULT"; exec @ARGV; die "exec failed: $!\n"' \
+      ./nettotalizer sh -c 'sleep 30' \
+    >"$tmpdir/macos-$signal.out" 2>"$tmpdir/macos-$signal.err" &
+  wrapper_pid=$!
+
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    [ -s "$nettop_pid_file" ] && break
+    sleep 0.1
+  done
+  [ -s "$nettop_pid_file" ] || fail "slow nettop did not start for $signal"
+
+  kill "-$signal" "$wrapper_pid" 2>/dev/null || true
+  (
+    sleep 5
+    if kill -0 "$wrapper_pid" 2>/dev/null; then
+      : >"$timeout_file"
+      kill -TERM "$wrapper_pid" 2>/dev/null || true
+      sleep 0.5
+      kill -KILL "$wrapper_pid" 2>/dev/null || true
+    fi
+  ) &
+  watchdog_pid=$!
+  wait "$wrapper_pid"
+  rc=$?
+  kill "$watchdog_pid" 2>/dev/null || true
+  wait "$watchdog_pid" 2>/dev/null || true
+  [ ! -e "$timeout_file" ] || fail "macOS pre-ready $signal wrapper did not exit"
+  assert_eq "$expected_status" "$rc" "macOS pre-ready $signal exit code"
+
+  pid=$(cat "$nettop_pid_file")
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -TERM "$pid" 2>/dev/null || true
+    fail "macOS pre-ready $signal leaked nettop process $pid"
+  fi
+
+  ok "macOS pre-ready $signal cleans up active nettop"
+}
+
+assert_macos_pre_ready_signal_cleanup INT 130
+assert_macos_pre_ready_signal_cleanup TERM 143
 
 NETTOTALIZER_FAKE_UNAME=Darwin \
   NETTOTALIZER_FAKE_NETTOP_MODE=fail \
