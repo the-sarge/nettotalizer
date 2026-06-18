@@ -157,6 +157,59 @@ measured_command_cleanup() {
   [ -n "${measured_command_gate:-}" ] && rm -f "$measured_command_gate" 2>/dev/null
 }
 
+run_command_unmeasured() {
+  "$@"
+  measured_command_exit_code=$?
+  measured_command_measurement_started=0
+}
+
+terminate_measured_command_adapter_jobs() {
+  local child
+
+  for child in $(jobs -p 2>/dev/null || true); do
+    [ -n "${cmd_pid:-}" ] && [ "$child" = "$cmd_pid" ] && continue
+    kill -TERM "$child" 2>/dev/null || true
+  done
+}
+
+reap_measured_command_adapter_jobs() {
+  local child
+
+  for child in $(jobs -p 2>/dev/null || true); do
+    [ -n "${cmd_pid:-}" ] && [ "$child" = "$cmd_pid" ] && continue
+    wait "$child" 2>/dev/null || true
+  done
+}
+
+abort_measured_command_before_release() {
+  local signal=$1
+  local status=$2
+
+  trap - INT
+  trap - TERM
+
+  terminate_measured_command_adapter_jobs
+  [ -n "${measured_command_adapter_stop:-}" ] &&
+    "$measured_command_adapter_stop" 2>/dev/null
+
+  if [ -n "${cmd_pid:-}" ]; then
+    kill "-$signal" "$cmd_pid" 2>/dev/null || true
+    wait "$cmd_pid" 2>/dev/null || true
+  fi
+
+  reap_measured_command_adapter_jobs
+  measured_command_cleanup
+  exit "$status"
+}
+
+abort_measured_command_int() {
+  abort_measured_command_before_release INT 130
+}
+
+abort_measured_command_term() {
+  abort_measured_command_before_release TERM 143
+}
+
 release_measured_command() {
   if [ -n "${measured_command_gate:-}" ] &&
     [ -p "$measured_command_gate" ] &&
@@ -179,22 +232,28 @@ run_measured_command_lifecycle() {
 
   measured_command_exit_code=0
   measured_command_measurement_started=0
+  measured_command_adapter_stop=$adapter_stop
   measured_command_gate=$(tmpfile) || {
     echo "$prog: mktemp failed; running unmeasured" >&2
-    exec "$@"
+    run_command_unmeasured "$@"
+    return
   }
 
   rm -f "$measured_command_gate"
   if ! mkfifo "$measured_command_gate"; then
     echo "$prog: mkfifo failed; running unmeasured" >&2
     measured_command_cleanup
-    exec "$@"
+    run_command_unmeasured "$@"
+    return
   fi
 
   run_command_background_gated "$measured_command_gate" "$@"
+  trap abort_measured_command_int INT
+  trap abort_measured_command_term TERM
 
   if ! "$adapter_start"; then
     echo "$prog: $adapter_failed_message; running unmeasured" >&2
+    "$adapter_stop"
     release_measured_command
     trap forward_int INT
     trap forward_term TERM
@@ -332,6 +391,7 @@ macos_measurement_start() {
     local pids pid
     local nettop_args
 
+    rm -f "$sampler_status" 2>/dev/null || true
     while kill -0 "$cmd_pid" 2>/dev/null; do
       # Rebuild the PID list every poll because package managers and git-like
       # tools often launch short-lived helpers. nettop accepts repeated -p flags,
@@ -343,7 +403,12 @@ macos_measurement_start() {
         nettop_args+=(-p "$pid")
       done
 
-      nettop "${nettop_args[@]}" >>"$nt_out" 2>/dev/null || true
+      if nettop "${nettop_args[@]}" >>"$nt_out" 2>/dev/null; then
+        [ -e "$sampler_status" ] || printf 'ready\n' >"$sampler_status"
+      elif [ ! -e "$sampler_status" ]; then
+        printf 'failed\n' >"$sampler_status"
+        break
+      fi
 
       # nettop -L 1 returns a current snapshot immediately. Poll quickly so
       # short-lived downloader children, such as Homebrew's fetch helpers, are
@@ -355,10 +420,27 @@ macos_measurement_start() {
 }
 
 macos_measurement_await_ready() {
-  return 0
+  local i status
+
+  for ((i = 0; i < 600; i++)); do
+    if [ -s "$sampler_status" ]; then
+      status=$(cat "$sampler_status")
+      [ "$status" = ready ] && return 0
+      return 2
+    fi
+
+    kill -0 "$sampler_pid" 2>/dev/null || return 2
+    sleep 0.05
+  done
+
+  return 1
 }
 
 macos_measurement_stop() {
+  [ -n "${sampler_pid:-}" ] || return 0
+  if [ -n "${cmd_pid:-}" ] && kill -0 "$cmd_pid" 2>/dev/null; then
+    kill -TERM "$sampler_pid" 2>/dev/null || true
+  fi
   wait "$sampler_pid" 2>/dev/null || true
 }
 
@@ -368,11 +450,11 @@ run_macos() {
     exec "$@"
   fi
 
-  local nt_out sampler_pid cmd_pid exit_code samples rx_tx rx tx
+  local nt_out sampler_status sampler_pid cmd_pid exit_code samples rx_tx rx tx
   local iface iface_before iface_after iface_rx_before iface_tx_before
   local iface_rx_after iface_tx_after iface_rx_delta iface_tx_delta fallback_used
   local measured_command_gate measured_command_exit_code
-  local measured_command_measurement_started
+  local measured_command_measurement_started measured_command_adapter_stop
 
   # macOS strategy, in plain English:
   #
@@ -395,8 +477,9 @@ run_macos() {
     echo "$prog: mktemp failed; running unmeasured" >&2
     exec "$@"
   }
+  sampler_status=$nt_out.status
 
-  trap 'rm -f "$nt_out" 2>/dev/null; measured_command_cleanup' EXIT
+  trap 'rm -f "$nt_out" "$sampler_status" 2>/dev/null; measured_command_cleanup' EXIT
 
   run_measured_command_lifecycle \
     macos_measurement_start \
@@ -406,6 +489,10 @@ run_macos() {
     "macOS sampler did not become ready before command start; measurement may undercount" \
     "$@"
   exit_code=$measured_command_exit_code
+
+  if [ "$measured_command_measurement_started" -ne 1 ]; then
+    exit "$exit_code"
+  fi
 
   # Parse the accumulated CSV snapshots.
   #
@@ -528,6 +615,7 @@ linux_measurement_await_ready() {
 }
 
 linux_measurement_stop() {
+  [ -n "${bt_pid:-}" ] || return 0
   kill -INT "$bt_pid" 2>/dev/null || true
   wait "$bt_pid" 2>/dev/null || true
 }
@@ -540,7 +628,7 @@ run_linux() {
 
   local bt_out bt_pid cmd_pid exit_code rx tx sudo_cmd
   local measured_command_gate measured_command_exit_code
-  local measured_command_measurement_started
+  local measured_command_measurement_started measured_command_adapter_stop
 
   # Linux strategy:
   #
