@@ -361,48 +361,71 @@ default_interface() {
   '
 }
 
-interface_bytes() {
+parse_interface_bytes() {
   local iface=$1
 
-  # Read cumulative link-layer byte counters for a single interface. We select
-  # the <Link#...> row to avoid duplicate address-family rows for the same
-  # interface. These counters include all traffic on that interface, not just the
-  # wrapped command, which is why the fallback emits an explicit warning.
-  netstat -ibn | awk -v iface="$iface" '
-    $1 == iface && $3 ~ /^<Link#/ {
-      print $(NF - 4) + 0, $(NF - 1) + 0
-      found = 1
-      exit
+  # Reduce netstat -ib output (on stdin) to "rx tx" for one interface, exiting
+  # nonzero when it is absent. The Ibytes/Obytes columns are found by header name
+  # but addressed from the right edge, so one rule spans the differing trailing
+  # columns of the macOS and BSD netstat dialects and survives rows that omit a
+  # leading Address column (macOS VPN/utun interfaces). This relies on data rows
+  # preserving the header's trailing-column count, which both dialects honor.
+  #
+  # An interface can appear on several rows (a <Link#...> row plus per-address-
+  # family rows). Prefer the <Link#...> row to match the historical macOS
+  # selection, falling back to the first matching row for layouts without one.
+  # These counters include all traffic on the interface, not just the wrapped
+  # command, which is why callers emit an explicit warning.
+  awk -v iface="$iface" '
+    /Ibytes/ && /Obytes/ {
+      for (i = 1; i <= NF; i++) {
+        if ($i == "Ibytes") ib = NF - i
+        if ($i == "Obytes") ob = NF - i
+      }
+      have_header = 1
+      next
     }
+
+    have_header && $1 == iface {
+      rx = $(NF - ib) + 0
+      tx = $(NF - ob) + 0
+      if ($3 ~ /^<Link#/ && !have_link) {
+        link_rx = rx; link_tx = tx; have_link = 1
+      }
+      if (!have_any) {
+        any_rx = rx; any_tx = tx; have_any = 1
+      }
+    }
+
     END {
-      if (!found) print "0 0"
+      if (have_link)     printf "%d %d\n", link_rx, link_tx
+      else if (have_any) printf "%d %d\n", any_rx, any_tx
+      else exit 1
     }
   '
 }
 
+clamped_delta() {
+  # after - before, floored at zero. Interface counters can reset or wrap across
+  # the measurement window, so a negative delta is reported as no traffic rather
+  # than a misleading huge number.
+  local before=$1 after=$2 delta
+  delta=$((after - before))
+  [ "$delta" -lt 0 ] && delta=0
+  printf '%d\n' "$delta"
+}
+
+interface_bytes() {
+  # macOS reader: netstat -ibn lists every interface; the parser selects ours.
+  # Returns "0 0" when the interface is absent so the fallback baseline stays
+  # well-defined.
+  netstat -ibn | parse_interface_bytes "$1" || printf '0 0\n'
+}
+
 bsd_interface_bytes() {
-  local iface=$1
-
-  # BSD netstat variants all support interface byte counters through the
-  # interface display with -b. Parse the Ibytes/Obytes headers instead of fixed
-  # columns because the surrounding packet/error columns vary by OS and version.
-  netstat -ibn -I "$iface" 2>/dev/null | awk -v iface="$iface" '
-    {
-      for (i = 1; i <= NF; i++) {
-        if ($i == "Ibytes") in_col = i
-        if ($i == "Obytes") out_col = i
-      }
-
-      if (in_col && out_col && $1 == iface) {
-        printf "%d %d\n", $in_col + 0, $out_col + 0
-        found = 1
-        exit
-      }
-    }
-    END {
-      if (!found) exit 1
-    }
-  '
+  # BSD reader: the same counters via the per-interface display. Empty output
+  # signals "not found", which the caller treats as unmeasured.
+  netstat -ibn -I "$1" 2>/dev/null | parse_interface_bytes "$1"
 }
 
 macos_measurement_start() {
@@ -642,10 +665,8 @@ run_macos() {
     iface_after=$(interface_bytes "$iface")
     read -r iface_rx_after iface_tx_after <<<"$iface_after"
 
-    iface_rx_delta=$((iface_rx_after - ${iface_rx_before:-0}))
-    iface_tx_delta=$((iface_tx_after - ${iface_tx_before:-0}))
-    [ "$iface_rx_delta" -lt 0 ] && iface_rx_delta=0
-    [ "$iface_tx_delta" -lt 0 ] && iface_tx_delta=0
+    iface_rx_delta=$(clamped_delta "${iface_rx_before:-0}" "$iface_rx_after")
+    iface_tx_delta=$(clamped_delta "${iface_tx_before:-0}" "$iface_tx_after")
 
     if [ "$iface_rx_delta" -gt 65536 ] &&
       [ "$iface_rx_delta" -gt $((${rx:-0} + 65536)) ] &&
@@ -867,10 +888,8 @@ run_bsd() {
   fi
   read -r rx_after tx_after <<<"$iface_after"
 
-  rx=$((rx_after - rx_before))
-  tx=$((tx_after - tx_before))
-  [ "$rx" -lt 0 ] && rx=0
-  [ "$tx" -lt 0 ] && tx=0
+  rx=$(clamped_delta "$rx_before" "$rx_after")
+  tx=$(clamped_delta "$tx_before" "$tx_after")
 
   echo "$prog: BSD backend uses $iface interface delta estimate; includes unrelated traffic" >&2
   print_summary "$rx" "$tx"
