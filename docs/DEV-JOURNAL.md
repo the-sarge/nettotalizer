@@ -98,3 +98,34 @@ Landed PR #7, the second refactor: the two sampler-output reducers now live in n
 **Next**
 
 - PR 3: unify the interface reader (`parse_interface_bytes`, header-from-right) + `clamped_delta`.
+
+---
+
+## Testable measurement modules — PR 3 (unified interface reader) landed - 2026-06-18 19:39 EDT
+
+**Main:** `e6fab9978d37`
+**Actor:** Claude Opus 4.8 (1M context)
+
+**Summary**
+
+Landed PR #8, the third refactor: the two divergent `netstat` interface-byte parsers are now one `parse_interface_bytes`, and both before/after delta sites share `clamped_delta`. One duplicate parser deleted.
+
+**Completed**
+
+- `parse_interface_bytes <iface>` — locates `Ibytes`/`Obytes` by header name addressed from the right edge, so one rule spans the macOS and BSD dialects and addressless (VPN/`utun`) rows; prefers the `<Link#...>` row.
+- `clamped_delta <before> <after>` — `max(0, after-before)` in one place; used by the macOS fallback and the BSD backend.
+- `interface_bytes`/`bsd_interface_bytes` reduced to thin wrappers preserving their not-found contracts (macOS `0 0`, BSD empty/nonzero).
+- Unit coverage: macOS standard, Link-row-preference (reordered rows), addressless `utun`, realistic BSD column layout, absent interface, and `clamped_delta`.
+
+**Decisions**
+
+- RAS `review-fix` found no blocking issues but flagged a **latent regression**: the unified parser had dropped the original `<Link#...>` row selection (taking the first matching row instead). Restored the Link-row preference inline — keeping the PR behavior-preserving — and added a discriminating row-selection test plus a realistic BSD fixture.
+- Deferred direct not-found tests for the thin wrappers to follow-up issue #9.
+
+**Validation**
+
+- `bash -n nettotalizer`, `bash tests/unit.sh`, `bash tests/smoke.sh` — green on `main` after squash-merge (`e6fab99`).
+
+**Next**
+
+- PR 4 (final): extract `should_use_interface_fallback`.
