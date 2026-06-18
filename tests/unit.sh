@@ -101,3 +101,42 @@ assert_eq "1 0 0" "$out" "nettop samples: zero-byte row still counts as sampled"
 out=$(printf '%s\n' ',bytes_out,bytes_in,' 'curl.456,400,300,' | parse_nettop_samples)
 assert_eq "1 300 400" "$out" "nettop samples: maps columns by header, not position"
 ok "parse_nettop_samples"
+
+# ---------------------------------------------------------------------------
+# parse_interface_bytes: locate Ibytes/Obytes by header, counted from the right
+# so one rule spans macOS, addressless macOS VPN rows, and BSD layouts.
+# ---------------------------------------------------------------------------
+macos_std=$(printf '%s\n' \
+  'Name Mtu Network Address Ipkts Ierrs Ibytes Opkts Oerrs Obytes Coll' \
+  'lo0 16384 <Link#1> 100 0 5000 100 0 5000 0' \
+  'en0 1500 <Link#5> 00:11:22:33:44:55 10 0 1000 20 0 2000 0' \
+  'en0 1500 192.168.1/24 192.168.1.5 10 0 1000 20 0 2000 0')
+out=$(printf '%s\n' "$macos_std" | parse_interface_bytes en0)
+assert_eq "1000 2000" "$out" "interface bytes: macOS standard row"
+out=$(printf '%s\n' "$macos_std" | parse_interface_bytes lo0)
+assert_eq "5000 5000" "$out" "interface bytes: selects the named interface"
+
+macos_utun=$(printf '%s\n' \
+  'Name Mtu Network Address Ipkts Ierrs Ibytes Opkts Oerrs Obytes Coll' \
+  'utun0 1380 <Link#23> 10 0 132072 20 0 6096 0')
+out=$(printf '%s\n' "$macos_utun" | parse_interface_bytes utun0)
+assert_eq "132072 6096" "$out" "interface bytes: addressless macOS VPN row"
+
+bsd=$(printf '%s\n' \
+  'Name Mtu Network Address Ibytes Obytes' \
+  'em0 1500 <Link#1> 00:11:22:33:44:55 4200 2600')
+out=$(printf '%s\n' "$bsd" | parse_interface_bytes em0)
+assert_eq "4200 2600" "$out" "interface bytes: BSD compact layout"
+
+out=$(printf '%s\n' "$bsd" | parse_interface_bytes wg0); rc=$?
+assert_eq "" "$out" "interface bytes: absent interface yields no output"
+assert_eq 1 "$rc" "interface bytes: absent interface yields nonzero status"
+ok "parse_interface_bytes"
+
+# ---------------------------------------------------------------------------
+# clamped_delta: after-before, floored at zero (counters can reset/wrap).
+# ---------------------------------------------------------------------------
+assert_eq 500 "$(clamped_delta 1000 1500)" "clamped delta: normal increase"
+assert_eq 0 "$(clamped_delta 1500 1000)" "clamped delta: decrease floored to zero"
+assert_eq 0 "$(clamped_delta 4200 4200)" "clamped delta: no change is zero"
+ok "clamped_delta"
