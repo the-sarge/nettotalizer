@@ -90,4 +90,14 @@ assert_eq "2 150 250" "$out" "nettop samples: dedupes exec rename, keeps max"
 
 out=$(printf '%s\n' ',bytes_in,bytes_out,' | parse_nettop_samples)
 assert_eq "0 0 0" "$out" "nettop samples: header-only reports zero samples"
+
+# A zero-byte data row is still a sample: samples=1 must differ from samples=0,
+# because run_macos warns only when nothing was sampled at all.
+out=$(printf '%s\n' ',bytes_in,bytes_out,' 'bash.123,0,0,' | parse_nettop_samples)
+assert_eq "1 0 0" "$out" "nettop samples: zero-byte row still counts as sampled"
+
+# Columns are discovered by header name, not position: a swapped header still maps
+# rx/tx correctly.
+out=$(printf '%s\n' ',bytes_out,bytes_in,' 'curl.456,400,300,' | parse_nettop_samples)
+assert_eq "1 300 400" "$out" "nettop samples: maps columns by header, not position"
 ok "parse_nettop_samples"
