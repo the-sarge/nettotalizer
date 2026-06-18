@@ -151,6 +151,13 @@ sys 4.08
 
 ## Testing
 
+Parser unit tests (no privileges or network needed; feeds canned tool output
+to the pure parser functions):
+
+```sh
+tests/parsers.sh
+```
+
 Local smoke tests:
 
 ```sh

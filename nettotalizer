@@ -73,10 +73,6 @@ EOF
   exit 64
 }
 
-case "${1:-}" in
-  ""|-h|--help) usage ;;
-esac
-
 # Render integer byte counts compactly. Bash has no portable floating point, so
 # awk handles the fractional KB/MB/GB cases.
 format_bytes() {
@@ -208,11 +204,20 @@ default_interface() {
 interface_bytes() {
   local iface=$1
 
-  # Read cumulative link-layer byte counters for a single interface. We select
-  # the <Link#...> row to avoid duplicate address-family rows for the same
-  # interface. These counters include all traffic on that interface, not just the
-  # wrapped command, which is why the fallback emits an explicit warning.
-  netstat -ibn | awk -v iface="$iface" '
+  # Read cumulative link-layer byte counters for a single interface. Fetching
+  # (running netstat) is kept separate from parsing so the parser can be unit
+  # tested with canned input. These counters include all traffic on that
+  # interface, not just the wrapped command, which is why the fallback emits an
+  # explicit warning.
+  netstat -ibn | parse_interface_bytes "$iface"
+}
+
+parse_interface_bytes() {
+  local iface=$1
+
+  # Select the <Link#...> row to avoid duplicate address-family rows for the
+  # same interface. Emits "rx tx", or "0 0" when the interface is absent.
+  awk -v iface="$iface" '
     $1 == iface && $3 ~ /^<Link#/ {
       print $7 + 0, $10 + 0
       found = 1
@@ -228,9 +233,18 @@ bsd_interface_bytes() {
   local iface=$1
 
   # BSD netstat variants all support interface byte counters through the
-  # interface display with -b. Parse the Ibytes/Obytes headers instead of fixed
-  # columns because the surrounding packet/error columns vary by OS and version.
-  netstat -ibn -I "$iface" 2>/dev/null | awk -v iface="$iface" '
+  # interface display with -b. Fetching is kept separate from parsing so the
+  # parser can be unit tested with canned input.
+  netstat -ibn -I "$iface" 2>/dev/null | parse_bsd_interface_bytes "$iface"
+}
+
+parse_bsd_interface_bytes() {
+  local iface=$1
+
+  # Parse the Ibytes/Obytes headers instead of fixed columns because the
+  # surrounding packet/error columns vary by OS and version. Emits "rx tx", or
+  # exits nonzero (empty output) when the interface row is absent.
+  awk -v iface="$iface" '
     {
       for (i = 1; i <= NF; i++) {
         if ($i == "Ibytes") in_col = i
@@ -245,6 +259,57 @@ bsd_interface_bytes() {
     }
     END {
       if (!found) exit 1
+    }
+  '
+}
+
+parse_nettop_csv() {
+  # Parse accumulated nettop CSV snapshots from stdin and emit "samples rx tx".
+  #
+  # Important details:
+  #   * nettop emits a header for each -L 1 invocation; discover columns from
+  #     headers instead of assuming a fixed layout.
+  #   * Data rows are keyed by "process-name.PID". Strip the trailing ".PID" and
+  #     key by PID so the same process is not double-counted when the gated bash
+  #     shim execs into the real command and the displayed name changes.
+  #   * Counters are cumulative per process, so the largest observed rx/tx value
+  #     for each PID is that PID's best final total.
+  #   * `samples` counts data rows. A zero sample count is different from a
+  #     sampled process with true 0B traffic, so callers warn only in the former.
+  awk -F',' '
+    # nettop CSV headers look like:
+    #   ,bytes_in,bytes_out,
+    #
+    # Capture column positions from the header instead of assuming fixed indexes.
+    /bytes_in|bytes_out/ {
+      for (i = 1; i <= NF; i++) {
+        if ($i == "bytes_in") in_col = i
+        if ($i == "bytes_out") out_col = i
+      }
+      next
+    }
+
+    in_col && out_col && $1 != "" {
+      samples++
+      key = $1
+      if (match(key, /\.[0-9]+$/)) {
+        key = substr(key, RSTART + 1)
+      }
+      seen[key] = 1
+      rx = $in_col + 0
+      tx = $out_col + 0
+
+      # Counters are cumulative, so the largest value seen is the final total.
+      if (rx > max_rx[key]) max_rx[key] = rx
+      if (tx > max_tx[key]) max_tx[key] = tx
+    }
+
+    END {
+      for (key in seen) {
+        total_rx += max_rx[key]
+        total_tx += max_tx[key]
+      }
+      printf "%d %d %d\n", samples + 0, total_rx + 0, total_tx + 0
     }
   '
 }
@@ -368,42 +433,7 @@ run_macos() {
   #     for each PID is that PID's best final total.
   #   * `samples` counts data rows. A zero sample count is different from a
   #     sampled process with true 0B traffic, so we warn only in the former case.
-  rx_tx=$(awk -F',' '
-    # nettop CSV headers look like:
-    #   ,bytes_in,bytes_out,
-    #
-    # Capture column positions from the header instead of assuming fixed indexes.
-    /bytes_in|bytes_out/ {
-      for (i = 1; i <= NF; i++) {
-        if ($i == "bytes_in") in_col = i
-        if ($i == "bytes_out") out_col = i
-      }
-      next
-    }
-
-    in_col && out_col && $1 != "" {
-      samples++
-      key = $1
-      if (match(key, /\.[0-9]+$/)) {
-        key = substr(key, RSTART + 1)
-      }
-      seen[key] = 1
-      rx = $in_col + 0
-      tx = $out_col + 0
-
-      # Counters are cumulative, so the largest value seen is the final total.
-      if (rx > max_rx[key]) max_rx[key] = rx
-      if (tx > max_tx[key]) max_tx[key] = tx
-    }
-
-    END {
-      for (key in seen) {
-        total_rx += max_rx[key]
-        total_tx += max_tx[key]
-      }
-      printf "%d %d %d\n", samples + 0, total_rx + 0, total_tx + 0
-    }
-  ' "$nt_out")
+  rx_tx=$(parse_nettop_csv <"$nt_out")
 
   read -r samples rx tx <<<"$rx_tx"
 
@@ -451,6 +481,18 @@ run_macos() {
   exit "$exit_code"
 }
 
+
+parse_bpftrace_output() {
+  # Read the RX/TX marker lines from stdin and emit "rx tx". Uses the last
+  # printed value of each in case bpftrace emits multiple lines around shutdown.
+  # Missing values collapse to 0 so measurement failure does not change the
+  # wrapped command's exit status.
+  awk '
+    /^NETTOTALIZER_RX / { rx = $2 }
+    /^NETTOTALIZER_TX / { tx = $2 }
+    END { printf "%d %d\n", rx + 0, tx + 0 }
+  '
+}
 
 run_linux() {
   if ! command -v bpftrace >/dev/null 2>&1; then
@@ -602,11 +644,7 @@ END
   kill -INT "$bt_pid" 2>/dev/null || true
   wait "$bt_pid" 2>/dev/null || true
 
-  # Use the last printed values in case bpftrace emits multiple lines around
-  # shutdown. Missing values intentionally collapse to 0 so measurement failure
-  # does not change the wrapped command's exit status.
-  rx=$(awk '/^NETTOTALIZER_RX / { value = $2 } END { print value + 0 }' "$bt_out")
-  tx=$(awk '/^NETTOTALIZER_TX / { value = $2 } END { print value + 0 }' "$bt_out")
+  read -r rx tx <<<"$(parse_bpftrace_output <"$bt_out")"
 
   print_summary "${rx:-0}" "${tx:-0}"
   exit "$exit_code"
@@ -655,12 +693,25 @@ run_bsd() {
   exit "$exit_code"
 }
 
-case "$(uname -s)" in
-  Darwin)                    run_macos "$@" ;;
-  Linux)                     run_linux "$@" ;;
-  FreeBSD|NetBSD|OpenBSD)    run_bsd "$@" ;;
-  *)
-    echo "$prog: unsupported platform $(uname -s); running unmeasured" >&2
-    exec "$@"
-    ;;
-esac
+main() {
+  case "${1:-}" in
+    ""|-h|--help) usage ;;
+  esac
+
+  case "$(uname -s)" in
+    Darwin)                    run_macos "$@" ;;
+    Linux)                     run_linux "$@" ;;
+    FreeBSD|NetBSD|OpenBSD)    run_bsd "$@" ;;
+    *)
+      echo "$prog: unsupported platform $(uname -s); running unmeasured" >&2
+      exec "$@"
+      ;;
+  esac
+}
+
+# Run only when executed directly. When sourced (for example by the parser unit
+# tests) this guard is false, so the functions above load without running the
+# platform dispatch.
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+  main "$@"
+fi
