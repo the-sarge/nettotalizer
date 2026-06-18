@@ -123,7 +123,26 @@ run_command_background_gated() {
   # the same PID.
   # Async bash jobs get /dev/null for stdin unless it is redirected explicitly.
   # Save fd 0 before reading the gate, then restore it for the measured command.
-  bash -c 'gate=$1; shift; exec 9<&0; IFS= read -r _ < "$gate"; exec 0<&9 9<&-; exec "$@"' \
+  # If the caller closed stdin, keep it closed and suppress duplicate-fd noise.
+  bash -c '
+    gate=$1
+    shift
+
+    stdin_open=0
+    if { exec 9<&0; } 2>/dev/null; then
+      stdin_open=1
+    fi
+
+    IFS= read -r _ < "$gate"
+
+    if [ "$stdin_open" -eq 1 ]; then
+      exec 0<&9 9<&-
+    else
+      exec 0<&-
+    fi
+
+    exec "$@"
+  ' \
     "$prog-runner" "$gate" "$@" <&0 &
 
   cmd_pid=$!

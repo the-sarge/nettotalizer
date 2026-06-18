@@ -146,6 +146,22 @@ tail -n 3 "$tmpdir/linux-stdin.err" | grep -q '^sent 512B$' ||
   fail "Linux measured stdin sent summary mismatch"
 ok "Linux measured command preserves piped stdin"
 
+closed_stdin_ready_file="$tmpdir/bpftrace-closed-stdin-ready"
+NETTOTALIZER_FAKE_UNAME=Linux \
+  NETTOTALIZER_FAKE_BPFTRACE_MODE=ready \
+  NETTOTALIZER_FAKE_READY_FILE="$closed_stdin_ready_file" \
+  PATH="$tmpdir/bin:$PATH" \
+  ./nettotalizer sh -c 'printf "%s" closed-ok; exit 23' \
+  <&- >"$tmpdir/linux-closed-stdin.out" 2>"$tmpdir/linux-closed-stdin.err"
+rc=$?
+assert_eq 23 "$rc" "Linux measured closed stdin exit code"
+assert_eq closed-ok "$(cat "$tmpdir/linux-closed-stdin.out")" \
+  "Linux measured closed stdin stdout"
+if grep -q 'Bad file descriptor' "$tmpdir/linux-closed-stdin.err"; then
+  fail "Linux measured closed stdin emitted fd diagnostics"
+fi
+ok "Linux measured command tolerates closed stdin"
+
 NETTOTALIZER_FAKE_UNAME=Linux \
   NETTOTALIZER_FAKE_BPFTRACE_MODE=fail-before-ready \
   PATH="$tmpdir/bin:$PATH" \
