@@ -274,7 +274,7 @@ cat >"$tmpdir/bin/route" <<'EOF'
 #!/usr/bin/env sh
 case "$*" in
   "-n get default")
-    printf '   interface: em0\n'
+    printf '   interface: %s\n' "${NETTOTALIZER_FAKE_ROUTE_IFACE:-em0}"
     ;;
   *)
     exit 1
@@ -324,6 +324,50 @@ tail -n 3 "$tmpdir/macos-pre-ready.err" | grep -q '^received 0B$' ||
 tail -n 3 "$tmpdir/macos-pre-ready.err" | grep -q '^sent 0B$' ||
   fail "macOS pre-ready interface traffic sent summary mismatch"
 ok "macOS fallback ignores pre-release interface traffic"
+
+cat >"$tmpdir/bin/netstat" <<EOF
+#!/usr/bin/env sh
+state='$tmpdir/macos-utun-netstat-state'
+count=\$(cat "\$state" 2>/dev/null || printf '0')
+count=\$((count + 1))
+printf '%s\n' "\$count" >"\$state"
+
+if [ "\$count" -eq 1 ]; then
+  rx=1000
+  tx=2000
+else
+  rx=132072
+  tx=6096
+fi
+
+cat <<NETSTAT
+Name Mtu Network Address Ipkts Ierrs Ibytes Opkts Oerrs Obytes Coll
+utun0 1380 <Link#23> 10 0 \$rx 20 0 \$tx 0
+NETSTAT
+EOF
+chmod +x "$tmpdir/bin/netstat" || fail "chmod fake macOS utun netstat failed"
+
+rm -f "$tmpdir/macos-utun-netstat-state"
+NETTOTALIZER_FAKE_UNAME=Darwin \
+  NETTOTALIZER_FAKE_ROUTE_IFACE=utun0 \
+  NETTOTALIZER_FAKE_NETTOP_MODE=ready \
+  PATH="$tmpdir/bin:$PATH" \
+  ./nettotalizer sh -c 'printf "%s\n" macos-utun-fallback' \
+  >"$tmpdir/macos-utun.out" 2>"$tmpdir/macos-utun.err"
+rc=$?
+assert_eq 0 "$rc" "macOS addressless interface fallback exit code"
+assert_eq macos-utun-fallback "$(cat "$tmpdir/macos-utun.out")" \
+  "macOS addressless interface fallback stdout"
+grep -q 'process samples undercounted received bytes; using utun0 interface delta' \
+  "$tmpdir/macos-utun.err" ||
+  fail "macOS addressless interface fallback warning missing"
+tail -n 3 "$tmpdir/macos-utun.err" | grep -q '^total 132.0KB$' ||
+  fail "macOS addressless interface fallback total summary mismatch"
+tail -n 3 "$tmpdir/macos-utun.err" | grep -q '^received 128.0KB$' ||
+  fail "macOS addressless interface fallback received summary mismatch"
+tail -n 3 "$tmpdir/macos-utun.err" | grep -q '^sent 4.0KB$' ||
+  fail "macOS addressless interface fallback sent summary mismatch"
+ok "macOS fallback parses addressless interface byte columns"
 
 cat >"$tmpdir/bin/netstat" <<EOF
 #!/usr/bin/env sh

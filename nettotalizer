@@ -357,7 +357,7 @@ interface_bytes() {
   # wrapped command, which is why the fallback emits an explicit warning.
   netstat -ibn | awk -v iface="$iface" '
     $1 == iface && $3 ~ /^<Link#/ {
-      print $7 + 0, $10 + 0
+      print $(NF - 4) + 0, $(NF - 1) + 0
       found = 1
       exit
     }
