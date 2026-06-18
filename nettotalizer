@@ -501,9 +501,10 @@ macos_measurement_after_release() {
 }
 
 macos_measurement_await_ready() {
-  local i status
+  local i status max_polls
+  max_polls=${NETTOTALIZER_TEST_READY_POLLS:-600}
 
-  for ((i = 0; i < 600; i++)); do
+  for ((i = 0; i < max_polls; i++)); do
     if [ -s "$sampler_status" ]; then
       status=$(cat "$sampler_status")
       [ "$status" = ready ] && return 0
@@ -519,9 +520,7 @@ macos_measurement_await_ready() {
 
 macos_measurement_stop() {
   [ -n "${sampler_pid:-}" ] || return 0
-  if [ -n "${cmd_pid:-}" ] && kill -0 "$cmd_pid" 2>/dev/null; then
-    kill -TERM "$sampler_pid" 2>/dev/null || true
-  fi
+  kill -TERM "$sampler_pid" 2>/dev/null || true
   wait "$sampler_pid" 2>/dev/null || true
 }
 

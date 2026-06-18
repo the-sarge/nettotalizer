@@ -375,6 +375,48 @@ assert_macos_pre_ready_signal_cleanup() {
 assert_macos_pre_ready_signal_cleanup INT 130
 assert_macos_pre_ready_signal_cleanup TERM 143
 
+stuck_nettop_pid_file="$tmpdir/stuck-nettop-timeout.pid"
+stuck_timeout_file="$tmpdir/stuck-nettop-timeout.timeout"
+rm -f "$stuck_nettop_pid_file"
+rm -f "$stuck_timeout_file"
+NETTOTALIZER_FAKE_UNAME=Darwin \
+  NETTOTALIZER_FAKE_NETTOP_MODE=slow-ready \
+  NETTOTALIZER_FAKE_NETTOP_PID_FILE="$stuck_nettop_pid_file" \
+  NETTOTALIZER_TEST_READY_POLLS=3 \
+  PATH="$tmpdir/bin:$PATH" \
+  ./nettotalizer sh -c 'printf "%s\n" macos-timeout-done; exit 29' \
+  >"$tmpdir/macos-timeout.out" 2>"$tmpdir/macos-timeout.err" &
+stuck_wrapper_pid=$!
+(
+  sleep 5
+  if kill -0 "$stuck_wrapper_pid" 2>/dev/null; then
+    : >"$stuck_timeout_file"
+    kill -TERM "$stuck_wrapper_pid" 2>/dev/null || true
+    sleep 0.5
+    kill -KILL "$stuck_wrapper_pid" 2>/dev/null || true
+  fi
+) &
+stuck_watchdog_pid=$!
+wait "$stuck_wrapper_pid"
+rc=$?
+kill "$stuck_watchdog_pid" 2>/dev/null || true
+wait "$stuck_watchdog_pid" 2>/dev/null || true
+[ ! -e "$stuck_timeout_file" ] || fail "macOS readiness timeout wrapper did not exit"
+assert_eq 29 "$rc" "macOS readiness timeout preserves exit code"
+assert_eq macos-timeout-done "$(cat "$tmpdir/macos-timeout.out")" \
+  "macOS readiness timeout stdout"
+grep -q 'macOS sampler did not become ready before command start; measurement may undercount' \
+  "$tmpdir/macos-timeout.err" ||
+  fail "macOS readiness timeout warning missing"
+if [ -s "$stuck_nettop_pid_file" ]; then
+  stuck_nettop_pid=$(cat "$stuck_nettop_pid_file")
+  if kill -0 "$stuck_nettop_pid" 2>/dev/null; then
+    kill -TERM "$stuck_nettop_pid" 2>/dev/null || true
+    fail "macOS readiness timeout leaked nettop process $stuck_nettop_pid"
+  fi
+fi
+ok "macOS readiness timeout stops stuck sampler"
+
 NETTOTALIZER_FAKE_UNAME=Darwin \
   NETTOTALIZER_FAKE_NETTOP_MODE=fail \
   PATH="$tmpdir/bin:$PATH" \
