@@ -151,6 +151,12 @@ sys 4.08
 
 ## Testing
 
+Unit tests:
+
+```sh
+tests/unit.sh
+```
+
 Local smoke tests:
 
 ```sh
