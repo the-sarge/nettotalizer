@@ -218,3 +218,35 @@ Fixed #2: `wait_for_command` could return a forwarded signal's status (`130`/`14
 **Outcome**
 
 - Follow-ups #2, #5, #6, #9 all closed. New follow-up #13 (SIGINT inheritance) open and tracked.
+
+---
+
+## Measured-command SIGINT fix landed (#13) - 2026-06-19 11:30 EDT
+
+**Main:** `f4d967f56b39`
+**Actor:** Claude Opus 4.8 (1M context)
+
+**Summary**
+
+Fixed #13: a command measured by `nettotalizer` ignored `SIGINT`, so Ctrl-C could not interrupt it. The async gated runner inherits `INT`/`QUIT` as `SIG_IGN` under POSIX async-job semantics, and that disposition survives `exec` into the measured command. The fix hands off through `perl` to restore the default `INT`/`QUIT` disposition before exec, keeping the measured command in the wrapper's own process group.
+
+**Completed**
+
+- `run_command_background_gated` now prepends a `perl` signal-reset shim (`$SIG{INT}=$SIG{QUIT}="DEFAULT"; exec { $ARGV[0] } @ARGV`) to the exec'd argv when `perl` is present. The block-form `exec` is shell-free (matches `exec "$@"`; no shell injection even for a single metacharacter arg) and mirrors bash's `127`/`126` exec-failure codes. `perl` is a soft dependency — when absent the runner execs directly: measurement still works and exit codes are preserved, but the measured command keeps `SIGINT` ignored as before.
+- Three smoke regressions, each mutation-checked: SIGINT delivery (a forwarded INT reaches the measured child and its deliberate exit code is preserved); process-group invariant (the measured command must not be its own group leader — guards against a separate process group and the resulting SIGTTIN hang); and the no-`perl` fallback (a PATH that hides only `perl` — the command still runs measured with its exit code preserved, no `running unmeasured`).
+- README documents `perl` as an optional dependency (Requirements note + Limitations cross-reference).
+
+**Decisions**
+
+- The fix suggested in #13 (`trap - INT QUIT` in the runner) does not work: POSIX forbids resetting a signal that was ignored on entry to a non-interactive shell. Verified a silent no-op on bash 3.2.57.
+- First implemented with scoped job control (`set -m`). RAS review revealed this places the measured command in a **separate process group**, which breaks terminal foreground/job-control semantics (a measured command reading the controlling terminal stops on `SIGTTIN`). The RAS auto-fixer then pursued *managing* the new process group (terminal foreground handoff via `perl`/`tcsetpgrp`, process-group forwarding, Ctrl-Z handling, PTY tests) and ballooned to ~1900 lines across two new dependencies (`perl` + `python3`) without converging (terminated at `max_fix_loops`). Abandoned: force-reset PR #14 to the clean base and switched to the `perl` signal-reset approach, which sidesteps the process group entirely. RAS retained a forensics worktree under `.ras/`.
+- Re-reviewed with a controlled one-shot `ras review` (read-only) rather than the auto-fixer. Both low-severity findings were fixed inline (README `perl` note; no-`perl` smoke coverage); four other findings were correctly adjudicated no-action (unconditional missing-`perl` warning would spam stderr; command-not-found message text is cosmetic with exit codes still matching bash; PTY coverage is a documented limitation; `SIGQUIT`-forwarding asymmetry is benign). `ras verify` was clean — no open items, no new concerns.
+
+**Validation**
+
+- `bash -n nettotalizer`, `bash tests/unit.sh`, `bash tests/smoke.sh` — green on `main` after squash-merge (`f4d967f`); smoke stable across repeated runs.
+- Coverage reality: `unit.sh` + `smoke.sh` run on macOS only; the real Linux/BSD paths are exercised only by smoke's process fakes. There is no true PTY/terminal-read test (a portable one would need `python3`/`expect`, declined); the process-group invariant guard covers the actual regression vector without that dependency.
+
+**Outcome**
+
+- #13 closed (completed). No new follow-up issues filed — all review findings were resolved inline.
