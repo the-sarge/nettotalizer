@@ -141,8 +141,74 @@ assert_wait_for_command_keeps_normal_reaped_status() {
   ok "wait_for_command keeps normal reaped status"
 }
 
+assert_wait_for_command_recovers_interrupted_exit_42() {
+  local wait_calls=0
+  local kill_calls=0
+  local rc
+
+  cmd_pid=454545
+
+  wait() {
+    wait_calls=$((wait_calls + 1))
+    case $wait_calls in
+      1)
+        wait_for_command_signal_seen=1
+        return 143
+        ;;
+      2)
+        return 42
+        ;;
+      *)
+        fail "wait_for_command called wait too many times"
+        ;;
+    esac
+  }
+
+  kill() {
+    if [ "${1:-}" = "-0" ] && [ "${2:-}" = "$cmd_pid" ]; then
+      kill_calls=$((kill_calls + 1))
+      return 1
+    fi
+
+    fail "wait_for_command called unexpected kill: $*"
+  }
+
+  wait_for_command
+  rc=$?
+  unset -f wait
+  unset -f kill
+  unset cmd_pid
+
+  # 42 is a distinctive non-sentinel status: a recovery that leaked an ambiguous
+  # 127 (bash's "no such job" status) instead of the real child status would fail.
+  assert_eq 42 "$rc" "interrupted wait recovery returns the verbatim child status"
+  assert_eq 2 "$wait_calls" "interrupted wait recovery reaps child status"
+  ok "wait_for_command returns the recovered child status after interrupted wait"
+}
+
+assert_forward_handlers_flag_signal_seen() {
+  local cmd_pid=515151
+  local wait_for_command_signal_seen
+
+  # Stub kill so the handlers exercise only the flag, not real signal delivery.
+  kill() { return 0; }
+
+  wait_for_command_signal_seen=0
+  forward_int
+  assert_eq 1 "$wait_for_command_signal_seen" "forward_int marks a forwarded signal"
+
+  wait_for_command_signal_seen=0
+  forward_term
+  assert_eq 1 "$wait_for_command_signal_seen" "forward_term marks a forwarded signal"
+
+  unset -f kill
+  ok "forward handlers flag a forwarded signal"
+}
+
 assert_wait_for_command_recovers_interrupted_exit_127
+assert_wait_for_command_recovers_interrupted_exit_42
 assert_wait_for_command_keeps_normal_reaped_status
+assert_forward_handlers_flag_signal_seen
 
 # format_bytes is already pure; characterize it now that it is reachable.
 assert_eq "0B"      "$(format_bytes 0)"          "format_bytes: zero"

@@ -406,8 +406,9 @@ assert_measured_signal_preserves_exit_code() {
     >"$tmpdir/measured-$signal.out" 2>"$tmpdir/measured-$signal.err" &
   wrapper_pid=$!
 
-  # The child writes the ready file only after the wrapper has released it and
-  # installed the forward trap, so signalling now exercises the measured path.
+  # The child writes the ready file only after the wrapper has released it; the
+  # poll-and-signal delay then targets the post-release forwarding path (the
+  # forward traps are installed just after release).
   for _ in $(seq 1 50); do
     [ -s "$ready_file" ] && break
     sleep 0.1
@@ -433,7 +434,7 @@ assert_measured_signal_preserves_exit_code() {
   ok "measured $signal preserves child exit code"
 }
 
-assert_measured_signal_preserves_exit_code TERM 127
+assert_measured_signal_preserves_exit_code TERM 42
 
 stuck_nettop_pid_file="$tmpdir/stuck-nettop-timeout.pid"
 stuck_timeout_file="$tmpdir/stuck-nettop-timeout.timeout"
