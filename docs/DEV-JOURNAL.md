@@ -189,3 +189,32 @@ Closed the test-hardening follow-ups #5, #6, #9 in one PR (#11). Test-only; no p
 **Next**
 
 - Follow-up PR 2: fix #2 (`wait_for_command` exit-status race).
+
+---
+
+## Follow-up — preserve exit status after interrupted wait (#2) landed - 2026-06-18 22:44 EDT
+
+**Main:** `ed9e91d4c3fb`
+**Actor:** Claude Opus 4.8 (1M context)
+
+**Summary**
+
+Fixed #2: `wait_for_command` could return a forwarded signal's status (`130`/`143`) instead of the measured command's real exit code in a narrow interrupted-wait race.
+
+**Completed**
+
+- `wait_for_command` now records whether a forwarding trap interrupted `wait` (a flag set in `forward_int`/`forward_term`, visible via bash dynamic scoping). When the child is gone, that flag is set, and the first status is `>128`, it runs one recovery `wait` and accepts the real reaped status verbatim.
+- Deterministic unit tests (mocked `wait`/`kill`) for the recovery path (genuine `127` and a distinctive `42`), the normal-reap path, and the `forward_int`/`forward_term` flag (mutation-verified). Measured-`TERM` smoke contract guard.
+
+**Decisions**
+
+- RAS `review-fix` caught a real bug in the first attempt: the `127` sentinel was ambiguous — bash returns `127` both for a child exiting `127` and for `wait` on an already-reaped PID — so a genuine `127` in the race would be discarded. Reworked to the signal-seen flag (the approach the review recommended). Three follow-up low findings (distinctive non-sentinel test value, trap-handler unit coverage, comment accuracy) were fixed inline.
+- **Discovery, filed as #13:** while building the regression I confirmed a separate pre-existing bug — a measured command launched via the async gated runner inherits `SIGINT` ignored (POSIX async-job semantics across `exec`), so Ctrl-C cannot interrupt it and the INT-forward path is a no-op. Repro and suggested fix in #13; kept out of scope here.
+
+**Validation**
+
+- `bash -n nettotalizer`, `bash tests/unit.sh`, `bash tests/smoke.sh` — green on `main` after squash-merge (`ed9e91d`).
+
+**Outcome**
+
+- Follow-ups #2, #5, #6, #9 all closed. New follow-up #13 (SIGINT inheritance) open and tracked.
