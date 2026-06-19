@@ -119,6 +119,22 @@ run_command_background_gated() {
   # Async bash jobs get /dev/null for stdin unless it is redirected explicitly.
   # Save fd 0 before reading the gate, then restore it for the measured command.
   # If the caller closed stdin, keep it closed and suppress duplicate-fd noise.
+  #
+  # A non-job-control shell forces SIGINT/SIGQUIT to SIG_IGN in async (&)
+  # children, and that ignored disposition survives `exec` into the measured
+  # command -- so Ctrl-C and a forwarded SIGINT would be silently ignored
+  # (issue #13). A non-interactive shell cannot reset a signal that was ignored
+  # on entry (`trap -` is a no-op), so when perl is available, hand off through
+  # it to restore the default INT/QUIT disposition at the syscall layer before
+  # exec. The block form `exec { $ARGV[0] } @ARGV` execs directly, never via a
+  # shell, matching `exec "$@"`. This keeps the measured command in the
+  # wrapper's own process group -- unlike `set -m`, which would place it in a
+  # separate group and break terminal foreground/job-control semantics. If perl
+  # is missing, exec directly: measurement still works, but the measured command
+  # keeps the inherited SIGINT-ignored behavior (no worse than before this fix).
+  if command -v perl >/dev/null 2>&1; then
+    set -- perl -e '$SIG{INT}="DEFAULT"; $SIG{QUIT}="DEFAULT"; exec { $ARGV[0] } @ARGV; warn "$ARGV[0]: $!\n"; exit($! == 2 ? 127 : 126)' -- "$@"
+  fi
   bash -c '
     gate=$1
     shift

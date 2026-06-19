@@ -436,6 +436,34 @@ assert_measured_signal_preserves_exit_code() {
 
 assert_measured_signal_preserves_exit_code TERM 42
 
+# Regression for #13: a forwarded SIGINT must reach the measured command. With
+# the bug, async-job INT is SIG_IGN and survives exec, so the child loops
+# forever and the helper's 5s watchdog fires (timeout -> fail). A distinct exit
+# code (47, not 130 and not TERM's 42) proves it is the child's deliberate code.
+assert_measured_signal_preserves_exit_code INT 47
+
+# Root-cause guard for #13: the SIGINT fix must NOT place the measured command in
+# its own process group. A separate group (e.g. from `set -m`) makes a measured
+# command that reads the controlling terminal stop on SIGTTIN and hang. The
+# measured command must share the wrapper's group, so it is not a group leader:
+# its own PID must differ from its process-group id.
+NETTOTALIZER_FAKE_UNAME=Darwin \
+  NETTOTALIZER_FAKE_NETTOP_MODE=ready \
+  PATH="$tmpdir/bin:$PATH" \
+  ./nettotalizer sh -c 'printf "%s %s\n" "$$" "$(ps -o pgid= -p $$ | tr -d " ")"' \
+  >"$tmpdir/measured-pgid.out" 2>"$tmpdir/measured-pgid.err"
+rc=$?
+assert_eq 0 "$rc" "measured process-group probe exit code"
+measured_pid=$(awk 'NR==1{print $1}' "$tmpdir/measured-pgid.out")
+measured_pgid=$(awk 'NR==1{print $2}' "$tmpdir/measured-pgid.out")
+if [ -z "$measured_pid" ] || [ -z "$measured_pgid" ]; then
+  fail "measured process-group probe produced no PID/PGID output"
+fi
+if [ "$measured_pid" = "$measured_pgid" ]; then
+  fail "measured command is its own process-group leader (PID=$measured_pid PGID=$measured_pgid); a separate group breaks terminal reads via SIGTTIN"
+fi
+ok "measured command shares the wrapper process group (no SIGTTIN regression)"
+
 stuck_nettop_pid_file="$tmpdir/stuck-nettop-timeout.pid"
 stuck_timeout_file="$tmpdir/stuck-nettop-timeout.timeout"
 rm -f "$stuck_nettop_pid_file"
