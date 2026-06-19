@@ -160,3 +160,32 @@ Landed PR #10, the final refactor: the macOS "trust the interface delta" policy 
 
 - Four behavior-preserving PRs (#4, #7, #8, #10) landed: main guard + five extracted modules (`parse_nettop_samples`, `parse_bpftrace_totals`, `parse_interface_bytes`, `clamped_delta`, `should_use_interface_fallback`), one duplicate parser deleted, `tests/unit.sh` added.
 - Open follow-ups: #5, #6 (PR 1 test infra), #9 (PR 3 wrapper not-found tests).
+
+---
+
+## Follow-ups — test-suite hardening (#5, #6, #9) landed - 2026-06-18 21:50 EDT
+
+**Main:** `6c35105e20c4`
+**Actor:** Claude Opus 4.8 (1M context)
+
+**Summary**
+
+Closed the test-hardening follow-ups #5, #6, #9 in one PR (#11). Test-only; no production change.
+
+**Completed**
+
+- #9 — direct unit tests for the thin wrappers' not-found contracts (`interface_bytes <absent>` → `0 0`; `bsd_interface_bytes <absent>` → empty + nonzero), driven by a stubbed `netstat` shell function.
+- #6 — clear positional parameters (`set --`) before both `source` sites in `tests/unit.sh`.
+- #5 — `tests/smoke.sh` now runs `bash tests/unit.sh` immediately after the syntax check, so the local gate covers the sourceable contract and all extracted modules.
+
+**Decisions**
+
+- RAS `review-fix` found no blocking issues. Two Info-level findings were fixed inline: the BSD wrapper stub now honors `-I <iface>` (so dropping that argument is caught — verified by a mutation check that fails the present-interface assertion), and the `set --` comment was reworded as defense-in-depth rather than fixing a currently-reachable dispatch leak (the main guard already blocks sourced dispatch).
+
+**Validation**
+
+- `bash tests/unit.sh`, `bash tests/unit.sh spurious-arg`, `bash tests/smoke.sh` (now runs unit first) — green on `main` after squash-merge (`6c35105`).
+
+**Next**
+
+- Follow-up PR 2: fix #2 (`wait_for_command` exit-status race).
