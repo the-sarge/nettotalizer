@@ -381,6 +381,61 @@ assert_macos_pre_ready_signal_cleanup() {
 assert_macos_pre_ready_signal_cleanup INT 130
 assert_macos_pre_ready_signal_cleanup TERM 143
 
+# A measured child that traps the forwarded signal and exits deliberately must
+# have its real exit code preserved, not replaced by 130/143. This is an
+# end-to-end contract guard; unit.sh force-injects the interrupted-wait race.
+assert_measured_signal_preserves_exit_code() {
+  local signal=$1
+  local expected=$2
+  local ready_file wrapper_pid rc timeout_file watchdog_pid
+
+  ready_file="$tmpdir/measured-$signal.ready"
+  timeout_file="$tmpdir/measured-$signal.timeout"
+  rm -f "$ready_file" "$timeout_file"
+
+  command -v perl >/dev/null 2>&1 ||
+    fail "perl not found for measured signal helper"
+
+  # Bash starts background jobs with SIGINT ignored. Reset it before execing the
+  # wrapper so this probe exercises nettotalizer's post-release forward trap.
+  NETTOTALIZER_FAKE_UNAME=Darwin \
+    NETTOTALIZER_FAKE_NETTOP_MODE=ready \
+    PATH="$tmpdir/bin:$PATH" \
+    perl -e '$SIG{INT} = "DEFAULT"; $SIG{TERM} = "DEFAULT"; exec @ARGV; die "exec failed: $!\n"' \
+      ./nettotalizer sh -c 'printf r >"$1"; trap "exit $2" '"$signal"'; while :; do sleep 0.1; done' sh "$ready_file" "$expected" \
+    >"$tmpdir/measured-$signal.out" 2>"$tmpdir/measured-$signal.err" &
+  wrapper_pid=$!
+
+  # The child writes the ready file only after the wrapper has released it; the
+  # poll-and-signal delay then targets the post-release forwarding path (the
+  # forward traps are installed just after release).
+  for _ in $(seq 1 50); do
+    [ -s "$ready_file" ] && break
+    sleep 0.1
+  done
+  [ -s "$ready_file" ] || fail "measured child did not start for $signal"
+
+  kill "-$signal" "$wrapper_pid" 2>/dev/null || true
+  (
+    sleep 5
+    if kill -0 "$wrapper_pid" 2>/dev/null; then
+      : >"$timeout_file"
+      kill -KILL "$wrapper_pid" 2>/dev/null || true
+    fi
+  ) &
+  watchdog_pid=$!
+  wait "$wrapper_pid"
+  rc=$?
+  kill "$watchdog_pid" 2>/dev/null || true
+  wait "$watchdog_pid" 2>/dev/null || true
+
+  [ ! -e "$timeout_file" ] || fail "measured $signal wrapper did not exit"
+  assert_eq "$expected" "$rc" "measured $signal preserves deliberate child exit code"
+  ok "measured $signal preserves child exit code"
+}
+
+assert_measured_signal_preserves_exit_code TERM 42
+
 stuck_nettop_pid_file="$tmpdir/stuck-nettop-timeout.pid"
 stuck_timeout_file="$tmpdir/stuck-nettop-timeout.timeout"
 rm -f "$stuck_nettop_pid_file"

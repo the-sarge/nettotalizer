@@ -144,23 +144,38 @@ run_command_background_gated() {
 }
 
 wait_for_command() {
-  local rc
+  local rc signal_seen wait_for_command_signal_seen
 
   # A forwarded signal can interrupt `wait` while the child is still alive. Keep
   # waiting until the child is actually gone so the wrapper returns the wrapped
   # command's real exit status, not the signal-interrupted wait status.
   while true; do
+    wait_for_command_signal_seen=0
     wait "$cmd_pid"
     rc=$?
-    kill -0 "$cmd_pid" 2>/dev/null || return "$rc"
+    signal_seen=$wait_for_command_signal_seen
+
+    if ! kill -0 "$cmd_pid" 2>/dev/null; then
+      # If a forwarding trap interrupted wait and the child exited before the
+      # liveness check, the first status is the interrupted wait's signal status.
+      # That wait did not reap the child, so fetch the real child status
+      # verbatim; 127 is a valid command exit code.
+      if [ "$signal_seen" -ne 0 ] && [ "$rc" -gt 128 ]; then
+        wait "$cmd_pid" 2>/dev/null
+        rc=$?
+      fi
+      return "$rc"
+    fi
   done
 }
 
 forward_int() {
+  wait_for_command_signal_seen=1
   [ -n "${cmd_pid:-}" ] && kill -INT "$cmd_pid" 2>/dev/null
 }
 
 forward_term() {
+  wait_for_command_signal_seen=1
   [ -n "${cmd_pid:-}" ] && kill -TERM "$cmd_pid" 2>/dev/null
 }
 
