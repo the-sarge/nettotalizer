@@ -37,7 +37,9 @@ fi
 ok "script is sourceable without running"
 
 # Load the modules under test for everything below. Clear positional parameters
-# first so a stray harness arg can never reach the sourced script's dispatch.
+# first as defense-in-depth: the main guard already blocks sourced dispatch
+# today, so this only guards against a future guard or top-level-arg change
+# leaking a stray harness arg into dispatch.
 set --
 source "$repo_root/nettotalizer"
 assert_eq "nettotalizer" "$prog" "sourcing sets prog from nettotalizer path"
@@ -160,6 +162,17 @@ assert_eq "0 0" "$(interface_bytes wg0)" "interface_bytes wrapper: absent interf
 unset -f netstat
 
 netstat() {
+  # Honor -I <iface> so the wrapper's argument passing is part of the contract:
+  # if bsd_interface_bytes stopped passing -I "$iface", this stub emits nothing
+  # and the present-interface assertion below fails.
+  local want=
+  while [ $# -gt 0 ]; do
+    case $1 in
+      -I) want=$2; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  [ "$want" = em0 ] || return 0
   printf '%s\n' \
     'Name Mtu Network Address Ipkts Ierrs Idrop Ibytes Opkts Oerrs Obytes Coll' \
     'em0 1500 <Link#1> 00:11:22:33:44:55 100 0 0 4200 200 0 2600 0'
