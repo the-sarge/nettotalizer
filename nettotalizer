@@ -144,7 +144,7 @@ run_command_background_gated() {
 }
 
 wait_for_command() {
-  local rc
+  local rc final_rc
 
   # A forwarded signal can interrupt `wait` while the child is still alive. Keep
   # waiting until the child is actually gone so the wrapper returns the wrapped
@@ -152,7 +152,18 @@ wait_for_command() {
   while true; do
     wait "$cmd_pid"
     rc=$?
-    kill -0 "$cmd_pid" 2>/dev/null || return "$rc"
+    if ! kill -0 "$cmd_pid" 2>/dev/null; then
+      # The child is gone. If the wait above was interrupted by a forwarded
+      # signal in the narrow race where the child then exited, rc is the
+      # interrupted status (130/143), not the child's. An interrupted wait does
+      # not reap the child, so one more wait fetches the real status. An already-
+      # reaped child returns 127, in which case rc already holds the child's
+      # status and we keep it.
+      wait "$cmd_pid" 2>/dev/null
+      final_rc=$?
+      [ "$final_rc" -ne 127 ] && rc=$final_rc
+      return "$rc"
+    fi
   done
 }
 
