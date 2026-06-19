@@ -28,7 +28,7 @@ assert_contains() {
 }
 
 # Keystone: the script is sourceable without running dispatch.
-src_out=$( ( source "$repo_root/nettotalizer" ) 2>&1 )
+src_out=$( ( set --; source "$repo_root/nettotalizer" ) 2>&1 )
 src_rc=$?
 assert_eq 0 "$src_rc" "sourcing nettotalizer does not run dispatch"
 if printf '%s\n' "$src_out" | grep -q 'Usage:'; then
@@ -36,7 +36,11 @@ if printf '%s\n' "$src_out" | grep -q 'Usage:'; then
 fi
 ok "script is sourceable without running"
 
-# Load the modules under test for everything below.
+# Load the modules under test for everything below. Clear positional parameters
+# first as defense-in-depth: the main guard already blocks sourced dispatch
+# today, so this only guards against a future guard or top-level-arg change
+# leaking a stray harness arg into dispatch.
+set --
 source "$repo_root/nettotalizer"
 assert_eq "nettotalizer" "$prog" "sourcing sets prog from nettotalizer path"
 ok "sourced prog name"
@@ -143,6 +147,42 @@ out=$(printf '%s\n' "$bsd" | parse_interface_bytes wg0); rc=$?
 assert_eq "" "$out" "interface bytes: absent interface yields no output"
 assert_eq 1 "$rc" "interface bytes: absent interface yields nonzero status"
 ok "parse_interface_bytes"
+
+# ---------------------------------------------------------------------------
+# interface_bytes / bsd_interface_bytes wrappers: not-found contracts differ
+# (macOS returns "0 0"; BSD returns empty + nonzero). Stub netstat to drive them.
+# ---------------------------------------------------------------------------
+netstat() {
+  printf '%s\n' \
+    'Name Mtu Network Address Ipkts Ierrs Ibytes Opkts Oerrs Obytes Coll' \
+    'en0 1500 <Link#5> 00:11:22:33:44:55 10 0 1000 20 0 2000 0'
+}
+assert_eq "1000 2000" "$(interface_bytes en0)" "interface_bytes wrapper: present interface"
+assert_eq "0 0" "$(interface_bytes wg0)" "interface_bytes wrapper: absent interface -> 0 0"
+unset -f netstat
+
+netstat() {
+  # Honor -I <iface> so the wrapper's argument passing is part of the contract:
+  # if bsd_interface_bytes stopped passing -I "$iface", this stub emits nothing
+  # and the present-interface assertion below fails.
+  local want=
+  while [ $# -gt 0 ]; do
+    case $1 in
+      -I) want=$2; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  [ "$want" = em0 ] || return 0
+  printf '%s\n' \
+    'Name Mtu Network Address Ipkts Ierrs Idrop Ibytes Opkts Oerrs Obytes Coll' \
+    'em0 1500 <Link#1> 00:11:22:33:44:55 100 0 0 4200 200 0 2600 0'
+}
+assert_eq "4200 2600" "$(bsd_interface_bytes em0)" "bsd_interface_bytes wrapper: present interface"
+wrap_out=$(bsd_interface_bytes wg0); wrap_rc=$?
+assert_eq "" "$wrap_out" "bsd_interface_bytes wrapper: absent interface -> empty"
+assert_eq 1 "$wrap_rc" "bsd_interface_bytes wrapper: absent interface -> nonzero status"
+unset -f netstat
+ok "interface byte wrappers"
 
 # ---------------------------------------------------------------------------
 # clamped_delta: after-before, floored at zero (counters can reset/wrap).
