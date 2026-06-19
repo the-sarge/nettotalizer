@@ -464,6 +464,40 @@ if [ "$measured_pid" = "$measured_pgid" ]; then
 fi
 ok "measured command shares the wrapper process group (no SIGTTIN regression)"
 
+# #13 soft-dependency contract: without perl the measured command must still run
+# and be measured (only the SIGINT reset is skipped) -- it must NOT fall back to
+# unmeasured. (An earlier set -m-based attempt regressed this, going unmeasured
+# when perl was absent.) Build a PATH resolving every tool EXCEPT perl, then
+# assert the command runs measured with its exit code preserved.
+noperl_bin="$tmpdir/noperl-bin"
+mkdir -p "$noperl_bin" || fail "mkdir noperl-bin failed"
+for d in /bin /usr/bin /usr/local/bin /opt/homebrew/bin /sbin /usr/sbin; do
+  [ -d "$d" ] || continue
+  for f in "$d"/*; do
+    [ -e "$f" ] || continue
+    b=${f##*/}
+    [ "$b" = perl ] && continue
+    [ -e "$noperl_bin/$b" ] || ln -s "$f" "$noperl_bin/$b" 2>/dev/null
+  done
+done
+if PATH="$tmpdir/bin:$noperl_bin" command -v perl >/dev/null 2>&1; then
+  fail "no-perl smoke setup still resolves perl on PATH"
+fi
+NETTOTALIZER_FAKE_UNAME=Darwin \
+  NETTOTALIZER_FAKE_NETTOP_MODE=ready \
+  PATH="$tmpdir/bin:$noperl_bin" \
+  ./nettotalizer sh -c 'printf "%s\n" no-perl-measured; exit 23' \
+  >"$tmpdir/noperl.out" 2>"$tmpdir/noperl.err"
+rc=$?
+assert_eq 23 "$rc" "measured command preserves exit code without perl"
+assert_eq no-perl-measured "$(cat "$tmpdir/noperl.out")" "measured stdout without perl"
+if grep -q 'running unmeasured' "$tmpdir/noperl.err"; then
+  fail "measured command fell back to unmeasured without perl"
+fi
+grep -Eq '^(total|received|sent) ' "$tmpdir/noperl.err" ||
+  fail "measurement summary missing without perl"
+ok "measured command runs measured without perl (soft dependency)"
+
 stuck_nettop_pid_file="$tmpdir/stuck-nettop-timeout.pid"
 stuck_timeout_file="$tmpdir/stuck-nettop-timeout.timeout"
 rm -f "$stuck_nettop_pid_file"
