@@ -382,11 +382,11 @@ assert_macos_pre_ready_signal_cleanup INT 130
 assert_macos_pre_ready_signal_cleanup TERM 143
 
 # A measured child that traps the forwarded signal and exits deliberately must
-# have its real exit code preserved, not replaced by 130/143. Guards #2: the
-# wait_for_command race where an interrupted wait could return the signal status.
+# have its real exit code preserved, not replaced by 130/143. This is an
+# end-to-end contract guard; unit.sh force-injects the interrupted-wait race.
 assert_measured_signal_preserves_exit_code() {
   local signal=$1
-  local expected=42
+  local expected=$2
   local ready_file wrapper_pid rc timeout_file watchdog_pid
 
   ready_file="$tmpdir/measured-$signal.ready"
@@ -402,7 +402,7 @@ assert_measured_signal_preserves_exit_code() {
     NETTOTALIZER_FAKE_NETTOP_MODE=ready \
     PATH="$tmpdir/bin:$PATH" \
     perl -e '$SIG{INT} = "DEFAULT"; $SIG{TERM} = "DEFAULT"; exec @ARGV; die "exec failed: $!\n"' \
-      ./nettotalizer sh -c 'printf r >"$1"; trap "exit 42" '"$signal"'; while :; do sleep 0.1; done' sh "$ready_file" \
+      ./nettotalizer sh -c 'printf r >"$1"; trap "exit $2" '"$signal"'; while :; do sleep 0.1; done' sh "$ready_file" "$expected" \
     >"$tmpdir/measured-$signal.out" 2>"$tmpdir/measured-$signal.err" &
   wrapper_pid=$!
 
@@ -433,7 +433,7 @@ assert_measured_signal_preserves_exit_code() {
   ok "measured $signal preserves child exit code"
 }
 
-assert_measured_signal_preserves_exit_code TERM
+assert_measured_signal_preserves_exit_code TERM 127
 
 stuck_nettop_pid_file="$tmpdir/stuck-nettop-timeout.pid"
 stuck_timeout_file="$tmpdir/stuck-nettop-timeout.timeout"

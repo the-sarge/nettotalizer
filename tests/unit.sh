@@ -61,6 +61,89 @@ assert_eq 64 "$stdin_help_rc" "stdin --help exits with usage status"
 assert_contains "Usage:" "$stdin_help_out" "stdin --help prints usage"
 ok "stdin help"
 
+assert_wait_for_command_recovers_interrupted_exit_127() {
+  local wait_calls=0
+  local kill_calls=0
+  local rc
+
+  cmd_pid=424242
+
+  wait() {
+    wait_calls=$((wait_calls + 1))
+    case $wait_calls in
+      1)
+        wait_for_command_signal_seen=1
+        return 143
+        ;;
+      2)
+        return 127
+        ;;
+      *)
+        fail "wait_for_command called wait too many times"
+        ;;
+    esac
+  }
+
+  kill() {
+    if [ "${1:-}" = "-0" ] && [ "${2:-}" = "$cmd_pid" ]; then
+      kill_calls=$((kill_calls + 1))
+      return 1
+    fi
+
+    fail "wait_for_command called unexpected kill: $*"
+  }
+
+  wait_for_command
+  rc=$?
+  unset -f wait
+  unset -f kill
+  unset cmd_pid
+
+  assert_eq 127 "$rc" "interrupted wait recovery preserves child exit 127"
+  assert_eq 2 "$wait_calls" "interrupted wait recovery reaps child status"
+  assert_eq 1 "$kill_calls" "interrupted wait recovery checks child liveness"
+  ok "wait_for_command preserves exit 127 after interrupted wait"
+}
+
+assert_wait_for_command_keeps_normal_reaped_status() {
+  local wait_calls=0
+  local kill_calls=0
+  local rc
+
+  cmd_pid=434343
+
+  wait() {
+    wait_calls=$((wait_calls + 1))
+    case $wait_calls in
+      1) return 42 ;;
+      *) fail "wait_for_command recovered without an interrupted wait" ;;
+    esac
+  }
+
+  kill() {
+    if [ "${1:-}" = "-0" ] && [ "${2:-}" = "$cmd_pid" ]; then
+      kill_calls=$((kill_calls + 1))
+      return 1
+    fi
+
+    fail "wait_for_command called unexpected kill: $*"
+  }
+
+  wait_for_command
+  rc=$?
+  unset -f wait
+  unset -f kill
+  unset cmd_pid
+
+  assert_eq 42 "$rc" "normal wait keeps child status when child is gone"
+  assert_eq 1 "$wait_calls" "normal wait does not run recovery wait"
+  assert_eq 1 "$kill_calls" "normal wait checks child liveness"
+  ok "wait_for_command keeps normal reaped status"
+}
+
+assert_wait_for_command_recovers_interrupted_exit_127
+assert_wait_for_command_keeps_normal_reaped_status
+
 # format_bytes is already pure; characterize it now that it is reachable.
 assert_eq "0B"      "$(format_bytes 0)"          "format_bytes: zero"
 assert_eq "1023B"   "$(format_bytes 1023)"       "format_bytes: sub-KB boundary"
