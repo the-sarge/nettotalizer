@@ -95,6 +95,8 @@ attaches its probes.
 On FreeBSD, NetBSD, and OpenBSD, it uses base-system `route` and `netstat`
 commands to read the default interface's byte counters.
 
+`perl` is optional. When it is available, `nettotalizer` uses it on the macOS and Linux backends to restore the default `SIGINT`/`SIGQUIT` disposition for the wrapped command, which a backgrounded measured process would otherwise inherit as *ignored*, so that Ctrl-C interrupts the command as usual. Without `perl`, measurement still works and exit codes are preserved, but the wrapped command keeps the inherited behavior in which `SIGINT` (Ctrl-C) is ignored.
+
 ## Installation
 
 Clone the repository and put the executable somewhere on your `PATH`:
@@ -229,6 +231,8 @@ routing.
 
 Unsupported platforms run the wrapped command unmeasured after printing a
 warning.
+
+Interrupting a wrapped command with Ctrl-C relies on `perl` (see Requirements). Without `perl`, the wrapped command runs with `SIGINT` ignored on the macOS and Linux backends, so Ctrl-C will not interrupt it; `SIGTERM` is unaffected.
 
 ## What this isn't
 
