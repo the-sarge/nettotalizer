@@ -32,6 +32,12 @@ cd "$repo_root" || fail "cd repo root failed"
 bash -n ./nettotalizer || fail "bash syntax check failed"
 ok "bash syntax"
 
+bash "$script_dir/unit.sh" >"$tmpdir/unit.out" 2>&1 || {
+  cat "$tmpdir/unit.out" >&2
+  fail "unit tests failed"
+}
+ok "unit tests"
+
 ./nettotalizer --help >"$tmpdir/help.out" 2>&1
 rc=$?
 assert_eq 64 "$rc" "help exit code"
