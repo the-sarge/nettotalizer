@@ -250,3 +250,32 @@ Fixed #13: a command measured by `nettotalizer` ignored `SIGINT`, so Ctrl-C coul
 **Outcome**
 
 - #13 closed (completed). No new follow-up issues filed — all review findings were resolved inline.
+
+---
+
+## Portfolio CI standard landed - 2026-08-19 23:57 EDT
+
+**Main:** `d867beb9c23a`
+**Actor:** Codex
+
+**Summary**
+
+Merged [PR #15](https://github.com/the-sarge/nettotalizer/pull/15), adopting the portfolio GitHub CI standard for this Bash-only repository.
+
+**Completed**
+
+- Added the standard draft-gated `pull_request` workflow with one required `ci-required` job on `ubuntu-latest`; the documented toolchain slot is empty, while checkout with full history, pinned Task setup, the standard guard, timeout, permissions, concurrency, and single `task ci` step remain intact.
+- Added the asset-derived classifier and `ci` target. `check` wraps `tests/smoke.sh`; `docs-check` validates whitespace over the classifier-selected revision range, including explicit base/head, renamed-remote, and local-branch fallback cases.
+- Added non-required Linux and macOS integration workflows on staggered weekly schedules plus manual dispatch. They were not dispatched during migration.
+- Applied active default-branch ruleset `21069336`: pull requests required, `ci-required` strict and required from GitHub Actions integration `15368`, squash-only merging, and deletion/force-push blocked.
+
+**Decisions**
+
+- A live docs-only route cannot be observed on the bootstrap migration PR because classification covers the complete PR diff, which necessarily contains the new CI source files. The PR records the limitation and focused local routing evidence; no stacked verification PR was created.
+- Review findings exposed two base-resolution gaps in the repository-owned `docs-check`; the final implementation mirrors the classifier input precedence and remote-then-local fallback without changing the copied classifier or `ci` task.
+
+**Validation**
+
+- `actionlint` passed all three workflows; local and live conformance audits reported no deviations; the classifier checksum matched the synced skill asset; and the complete smoke suite passed locally.
+- Draft run `32328796183` skipped `ci-required`. After readiness, PR #15 was blocked while run `32329099246` was pending; that exact-head run then passed `ci-required` and the smoke suite before squash merge at `e548fa24c617a69f6fb7cf19624a75a273fe4092`.
+- Initial review `20260820T015748-b516a77adb9888c20456b36b` and final replacement review `20260820T021910-01043f192ce6192e6859efb6` were verified clear. The squash merge landed as `d867beb9c23ac58b26f35a53a27be30f369e858b`.
