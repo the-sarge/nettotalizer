@@ -1,0 +1,43 @@
+version: '3'
+
+vars:
+  # Space-separated shell globs treated as documentation by scripts/ci-classify.sh.
+  CI_DOCS_GLOBS: '*.md docs/* DEV-JOURNAL.md LICENSE LICENSE.*'
+
+tasks:
+  ci:
+    desc: Required merge gate; docs-only changes run docs-check, everything else runs check
+    cmds:
+      - |
+        result="$(CI_DOCS_GLOBS='{{.CI_DOCS_GLOBS}}' scripts/ci-classify.sh)"
+        case "$result" in
+          docs_only=true) task docs-check ;;
+          *) task check ;;
+        esac
+
+  docs-check:
+    desc: Check documentation-only changes for whitespace errors
+    cmds:
+      - |
+        base="$(git merge-base "origin/${GITHUB_BASE_REF:-main}" HEAD)"
+        git diff --check "$base" HEAD
+
+  check:
+    desc: Ordinary merge gate
+    cmds:
+      - ./tests/smoke.sh
+
+  linux-integration:
+    desc: Native Linux integration test
+    cmds:
+      - ./tests/linux.sh
+
+  linux-docker-integration:
+    desc: Privileged Docker Linux integration test
+    cmds:
+      - ./tests/linux-docker.sh
+
+  macos-integration:
+    desc: Native macOS integration test
+    cmds:
+      - ./tests/macos.sh
