@@ -1,0 +1,61 @@
+version: '3'
+
+vars:
+  # Space-separated shell globs treated as documentation by scripts/ci-classify.sh.
+  CI_DOCS_GLOBS: '*.md docs/* DEV-JOURNAL.md LICENSE LICENSE.*'
+
+tasks:
+  ci:
+    desc: Required merge gate; docs-only changes run docs-check, everything else runs check
+    cmds:
+      - |
+        result="$(CI_DOCS_GLOBS='{{.CI_DOCS_GLOBS}}' scripts/ci-classify.sh)"
+        case "$result" in
+          docs_only=true) task docs-check ;;
+          *) task check ;;
+        esac
+
+  docs-check:
+    desc: Check documentation-only changes for whitespace errors
+    cmds:
+      - |
+        remote="${CI_REMOTE:-origin}"
+        head="${CI_HEAD_SHA:-HEAD}"
+        default_branch="${CI_DEFAULT_BRANCH:-${GITHUB_BASE_REF:-}}"
+        if test -z "$default_branch"; then
+          default_branch="$(git symbolic-ref -q --short "refs/remotes/$remote/HEAD" 2>/dev/null | sed "s#^$remote/##" || true)"
+          default_branch="${default_branch:-main}"
+        fi
+        base="${CI_BASE_SHA:-}"
+        if test -z "$base"; then
+          if git rev-parse --verify -q "$remote/$default_branch^{commit}" >/dev/null; then
+            base="$(git merge-base "$remote/$default_branch" "$head")"
+          elif git rev-parse --verify -q "$default_branch^{commit}" >/dev/null; then
+            base="$(git merge-base "$default_branch" "$head")"
+          fi
+        fi
+        if test -z "$base" || ! git rev-parse --verify -q "$base^{commit}" >/dev/null || ! git rev-parse --verify -q "$head^{commit}" >/dev/null; then
+          echo "docs-check: cannot determine a trustworthy revision range" >&2
+          exit 1
+        fi
+        git diff --check "$base" "$head"
+
+  check:
+    desc: Ordinary merge gate
+    cmds:
+      - ./tests/smoke.sh
+
+  linux-integration:
+    desc: Native Linux integration test
+    cmds:
+      - ./tests/linux.sh
+
+  linux-docker-integration:
+    desc: Privileged Docker Linux integration test
+    cmds:
+      - ./tests/linux-docker.sh
+
+  macos-integration:
+    desc: Native macOS integration test
+    cmds:
+      - ./tests/macos.sh

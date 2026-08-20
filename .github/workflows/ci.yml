@@ -1,0 +1,31 @@
+# Portfolio required CI workflow. Copy verbatim; change only `runs-on`
+# and the marked toolchain setup slot below (replace with the repository's
+# own SHA-pinned toolchain setup, or delete it when there is nothing to
+# install), and, when a repository has additional merge-blocking lanes, add
+# sibling `ci-<lane>` jobs with the same guard, timeout, setup steps, and
+# one `task ci-<lane>` step. Never add `strategy.matrix`, other triggers, or
+# path filters; `needs` is allowed only on a destination `ci-<lane>` job of
+# a cross-runner artifact exchange (see references/ci-policy.md).
+name: ci
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+concurrency:
+  group: ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  ci-required:
+    if: ${{ !github.event.pull_request.draft && github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: arduino/setup-task@c0bc642852239c2689f73f4ea6459c29405f3c52 # v3.0.0
+        with:
+          version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - run: task ci
