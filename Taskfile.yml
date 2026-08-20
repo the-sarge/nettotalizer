@@ -19,8 +19,18 @@ tasks:
     desc: Check documentation-only changes for whitespace errors
     cmds:
       - |
-        base="$(git merge-base "origin/${GITHUB_BASE_REF:-main}" HEAD)"
-        git diff --check "$base" HEAD
+        remote="${CI_REMOTE:-origin}"
+        head="${CI_HEAD_SHA:-HEAD}"
+        default_branch="${CI_DEFAULT_BRANCH:-${GITHUB_BASE_REF:-}}"
+        if test -z "$default_branch"; then
+          default_branch="$(git symbolic-ref -q --short "refs/remotes/$remote/HEAD" 2>/dev/null | sed "s#^$remote/##" || true)"
+          default_branch="${default_branch:-main}"
+        fi
+        base="${CI_BASE_SHA:-}"
+        if test -z "$base"; then
+          base="$(git merge-base "$remote/$default_branch" "$head")"
+        fi
+        git diff --check "$base" "$head"
 
   check:
     desc: Ordinary merge gate
