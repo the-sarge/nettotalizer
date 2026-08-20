@@ -28,7 +28,15 @@ tasks:
         fi
         base="${CI_BASE_SHA:-}"
         if test -z "$base"; then
-          base="$(git merge-base "$remote/$default_branch" "$head")"
+          if git rev-parse --verify -q "$remote/$default_branch^{commit}" >/dev/null; then
+            base="$(git merge-base "$remote/$default_branch" "$head")"
+          elif git rev-parse --verify -q "$default_branch^{commit}" >/dev/null; then
+            base="$(git merge-base "$default_branch" "$head")"
+          fi
+        fi
+        if test -z "$base" || ! git rev-parse --verify -q "$base^{commit}" >/dev/null || ! git rev-parse --verify -q "$head^{commit}" >/dev/null; then
+          echo "docs-check: cannot determine a trustworthy revision range" >&2
+          exit 1
         fi
         git diff --check "$base" "$head"
 
